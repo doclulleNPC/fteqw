@@ -2658,7 +2658,12 @@ void SV_Begin_Core(client_t *split)
 								if (doom_player1_start[0] || doom_player1_start[1] || doom_player1_start[2])
 								{
 									VectorCopy(doom_player1_start, split->edict->v->origin);
-									split->edict->v->angles[1] = doom_player1_yaw;
+									//set the VIEW yaw (v_angle), not just the entity angle: the cmd below and
+									//SV_SendFixAngle both read v_angle, so v->angles alone never reached the client
+									//(player always faced east). fixangle makes the client snap to it.
+									split->edict->v->angles[1]  = doom_player1_yaw;
+									split->edict->v->v_angle[1] = doom_player1_yaw;
+									split->edict->v->fixangle   = FIXANGLE_FIXED;
 								}
 							}
 #endif
@@ -5814,7 +5819,9 @@ void SV_SetUpClientEdict (client_t *cl, edict_t *ent)
 		Cbuf_AddText("sv_stepheight 24.1\n", 0);
 		// VectorCopy(doom_player1_start, ent->v->origin);
 		VectorCopy(doom_player1_start, ent->v->origin);
-		ent->v->angles[1] = doom_player1_yaw;
+		ent->v->angles[1]  = doom_player1_yaw;	//set the view yaw too (see PutClientInServer) so the facing applies
+		ent->v->v_angle[1] = doom_player1_yaw;
+		ent->v->fixangle   = FIXANGLE_FIXED;
 		ent->v->view_ofs[2] = 17;	//DOOM eye height 41, minus the 24u the origin sits above the feet (mins.z=-24)
 
 		// Enable proper physics: walk on floors, collide with walls

@@ -25,7 +25,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "pr_common.h"
 
 #ifdef MAP_DOOM
-void Doom_TickDoors(struct model_s *model, float frametime);
+void Doom_TickDoors(struct model_s *model, float frametime, const float *playerorg);
 void Doom_TickMonsters(struct model_s *model, float frametime, const float *playerorg, float *playerhealth, float *playerarmor, int godmode);
 #endif
 
@@ -2584,7 +2584,11 @@ qboolean SV_Physics (void)
 	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
 	{
 		int ci;
-		Doom_TickDoors(sv.world.worldmodel, (float)trueframetime);
+		float *doorplayer = NULL;	//a player under a closing door reverses it (crush-protect)
+		for (ci = 0; ci < svs.allocated_client_slots; ci++)
+			if (svs.clients[ci].state == cs_spawned && svs.clients[ci].edict)
+			{ doorplayer = svs.clients[ci].edict->v->origin; break; }
+		Doom_TickDoors(sv.world.worldmodel, (float)trueframetime, doorplayer);
 		for (ci = 0; ci < svs.allocated_client_slots; ci++)
 			if (svs.clients[ci].state == cs_spawned && svs.clients[ci].edict)
 			{

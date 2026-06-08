@@ -2,6 +2,7 @@
 #ifdef MAP_DOOM
 #include "glquake.h"
 #include "shader.h"
+#include "com_mesh.h"	//galiasinfo_t/pose - for the MD2 monster-model renderer (Doom_DrawModel)
 
 vec3_t doom_player1_start;
 float  doom_player1_yaw;
@@ -11,6 +12,15 @@ static shader_t *Doom_MonsterSpriteShader(const char *lump, short *w, short *h, 
 static shader_t *Doom_SpriteShaderFor(const char *lump, texid_t tex);
 static void Doom_VoxShader(void);
 static qboolean Doom_DrawVoxelByName(const char *name, const vec3_t origin, float yawdeg, float scale);
+static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale);
+static void Doom_EmitFX(doommap_t *dm);	//drain dm->fx -> particle effects (client render)
+//MD2 animation phases (doommodels.def): monster walk/attack/pain/die/gib; decorations use 'walk' for idle/spin.
+#define DMDL_WALK   0
+#define DMDL_ATTACK 1
+#define DMDL_PAIN   2
+#define DMDL_DIE    3
+#define DMDL_GIB    4	//xdeath: parsed but not yet used by the renderer
+#define DMDL_NUMPH  5
 void Doom_PlaySound(const vec3_t org, const char *lump);
 
 
@@ -331,6 +341,7 @@ typedef struct doommap_s
 		qbyte		alerted;	// 0 until the monster sees or hears the player, then it chases
 		qbyte		floating;	// 1 = moves in 3D (caco/lostsoul/pain), doesn't snap to floor
 		qbyte		exploded;	// barrels: 1 once the blast has been dealt
+		qbyte		gibbed;		// 1 if killed by overkill damage (health < -spawnhealth): show gibs, not the corpse
 		qbyte		dropped;	// 1 once this monster has dropped its item on death (former humans)
 		qbyte		atkpend;	// pending attack to resolve mid-animation: MATK_* of the chosen attack
 		float		animt;		// walk-cycle animation timer (front frames A-D in shader[0..3])
@@ -371,6 +382,11 @@ typedef struct doommap_s
 		short		w, h, xo, yo;
 	} *projectiles;
 	unsigned int numprojectiles;
+
+	//transient visual effects (blood/gibs/explosions) queued by the server tick and emitted as
+	//particles once per frame by the client render (R_DoomWorld -> Doom_EmitFX); see DFX_* below.
+	struct doomfx_s { vec3_t org; qbyte type; } fx[64];
+	int numfx;
 } doommap_t;
 
 void Doom_SetModelFunc(model_t *mod);
@@ -663,8 +679,40 @@ void Doom_ActivateLinedef(model_t *model, int linedef_idx)
 	}
 }
 
+msector_t *Doom_SectorNearPoint(doommap_t *dm, const vec3_t p);	//defined below
+
+//Is an actor (the player or any live monster) standing in this door sector with too little
+//headroom under the closing ceiling? Vanilla Doom (P_ChangeSector / T_VerticalDoor) reverses a
+//closing door that would crush a thing, so you never get sealed in. We measure headroom from the
+//sector floor (Doom actors stand on it) against the standard 56-unit actor height - robust to the
+//engine's z-origin convention. Corpses (mstate 2) don't block, matching vanilla.
+static qboolean Doom_DoorBlocked(doommap_t *dm, int sector_idx, float newceil, const float *playerorg)
+{
+	msector_t *sec = &dm->sector[sector_idx];
+	const float ah = 56;	//Doom actor height (player + the humanoid monsters)
+	unsigned int i;
+	vec3_t p;
+	if (newceil >= sec->floorheight + ah)
+		return false;	//still room for a full-height actor: nothing can be crushed
+	if (playerorg)
+	{
+		VectorCopy(playerorg, p);
+		if (Doom_SectorNearPoint(dm, p) == sec)
+			return true;
+	}
+	for (i = 0; i < dm->nummonsters; i++)
+	{
+		struct doommonster_s *m = &dm->monsters[i];
+		if (m->mstate == 2)
+			continue;	//corpse: doesn't block (vanilla lets doors close over dead bodies)
+		if (Doom_SectorNearPoint(dm, m->origin) == sec)
+			return true;
+	}
+	return false;
+}
+
 // Per-frame tick: animate all active door/platform/floor sectors
-void Doom_TickDoors(model_t *model, float frametime)
+void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 {
 	doommap_t *dm = model->meshinfo;
 	unsigned int i;
@@ -747,10 +795,19 @@ void Doom_TickDoors(model_t *model, float frametime)
 					} else d->state = 0;
 				}
 			} else {
-				sec->ceilingheight -= move;
-				if (sec->ceilingheight <= sec->floorheight + 4) {
-					sec->ceilingheight = sec->floorheight + 4;
-					d->state = 0;
+				float newceil = sec->ceilingheight - move;
+				if (newceil < sec->floorheight + 4)
+					newceil = sec->floorheight + 4;
+				if (Doom_DoorBlocked(dm, d->sector_idx, newceil, playerorg)) {
+					//something's underneath: bounce the door back open (vanilla crush-reverse) so
+					//the player/monster doesn't get sealed in. Repeating doors will wait and retry.
+					d->state = 1;
+				} else {
+					sec->ceilingheight = newceil;
+					if (sec->ceilingheight <= sec->floorheight + 4) {
+						sec->ceilingheight = sec->floorheight + 4;
+						d->state = 0;
+					}
 				}
 			}
 			break;
@@ -1628,12 +1685,21 @@ static void R_DoomDrawSprites(doommap_t *dm)
 	byte_vec4_t col[4];
 	index_t idx[6] = {0,1,2, 0,2,3};
 
-	int usevox; float voxscale, voxyaw;
+	int usevox, usemod, spin; float voxscale, voxyaw, modscale, decoryaw, modz, spinrate;
 	if (!dm->numsprites)
 		return;
 	usevox  = (int)Cvar_Get("doom_voxels", "1", CVAR_ARCHIVE, "Doom")->value;
 	voxscale= Cvar_Get("doom_voxscale", "1", CVAR_ARCHIVE, "Doom")->value;
 	voxyaw  = Cvar_Get("doom_voxyaw", "90", CVAR_ARCHIVE, "Doom")->value;
+	usemod  = (int)Cvar_Get("doom_models", "1", CVAR_ARCHIVE, "Doom")->value;	//MD2 item/key models take priority over voxels
+	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;
+	//decorations have no AI facing, so they sit at a fixed world yaw. Their models are authored 90 CW
+	//of the monster convention (doom_modyaw 0), hence a separate offset - default -90 (90 CW).
+	decoryaw= Cvar_Get("doom_moddecoryaw", "-90", CVAR_ARCHIVE, "Doom")->value;
+	modz    = Cvar_Get("doom_modz", "0", CVAR_ARCHIVE, "Doom")->value;
+	spin    = (int)(realtime / 0.12);	//idle/spin frame index for animated pickups (powerups, bonuses)
+	//collectable pickups (incl. monster drops) spin around their vertical axis, like gzdoom voxel items
+	spinrate= Cvar_Get("doom_modspin", "90", CVAR_ARCHIVE, "Doom")->value;	//degrees/sec (0 = no spin)
 	if (usevox) Doom_VoxShader();
 
 	//cylindrical billboard: sprites stay upright and turn to face the player horizontally
@@ -1660,8 +1726,22 @@ static void R_DoomDrawSprites(doommap_t *dm)
 		struct doomsprite_s *s = &dm->sprites[i];
 		float zb = s->origin[2];	//rest the sprite's bottom on the floor (Doom items sit on the ground)
 		float zt = zb + s->h;
+		//collectable pickups (and monster drops) spin around their vertical axis (gzdoom voxel-item look)
+		float pspin = s->pickup ? (float)(realtime*spinrate) : 0;
 		vec3_t l, r;
-		if (usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, voxyaw, voxscale))
+		if (usemod && s->voxname[0])
+		{	//MD2 model for this decoration/pickup, if a def exists. Try the full sprite+frame name
+			//first (e.g. PLAYN dead vs PLAYW gibbed share the PLAY prefix), then the 4-char sprite
+			//prefix (items/keys/gore/bodies). The "walk" phase holds the idle/spin frames; count=0
+			//steps `spin` through them directly.
+			char pfx[5]; vec3_t mo;
+			pfx[0]=s->voxname[0]; pfx[1]=s->voxname[1]; pfx[2]=s->voxname[2]; pfx[3]=s->voxname[3]; pfx[4]=0;
+			VectorCopy(s->origin, mo); mo[2]+=modz;
+			if (Doom_DrawModel(s->voxname, DMDL_WALK, spin, 0, mo, decoryaw+pspin, modscale) ||
+			    Doom_DrawModel(pfx,        DMDL_WALK, spin, 0, mo, decoryaw+pspin, modscale))
+				continue;
+		}
+		if (usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, voxyaw+pspin, voxscale))
 			continue;	//rendered as a voxel; otherwise fall back to the sprite billboard
 		if (!s->shader)
 			continue;
@@ -1736,6 +1816,7 @@ void R_DoomWorld(void)
 
 	R_DoomDrawSprites(dm);	//item/decoration billboards, over the opaque world
 	R_DoomDrawMonsters(dm);	//monsters (billboards), over the opaque world
+	Doom_EmitFX(dm);	//spawn queued blood/gib/explosion particles (drained once per frame)
 	//the HUD (status bar + first-person weapon) is drawn later in the 2D screen pass,
 	//via Doom_DrawHUD2D() called from SCR_DrawTwoDimensional (screen space, where R2D_* works).
 }
@@ -2352,6 +2433,30 @@ static const char *Doom_ThingSprite(unsigned short type)
 	case 43:   return "TRE1A0";	//burnt tree
 	case 54:   return "TRE2A0";	//large brown tree
 	case 47:   return "SMITA0";	//stalagmite
+	//gore on the floor
+	case 24:   return "POL5A0";	//pool of blood and flesh
+	case 79:   return "POB1A0";	//pool of blood (Doom 2)
+	case 80:   return "POB2A0";	//pool of blood (Doom 2)
+	case 81:   return "BRS1A0";	//pool of brains (Doom 2)
+	//impaled humans / skull poles (stand on the floor)
+	case 25:   return "POL1A0";	//impaled human
+	case 26:   return "POL6A0";	//twitching impaled human
+	case 27:   return "POL4A0";	//skull on a pole
+	case 28:   return "POL2A0";	//five skulls "shish kebab"
+	case 29:   return "POL3A0";	//pile of skulls and candles
+	//hanging victims, GOR sprites (hang from the ceiling) - solid + non-solid variants share a sprite
+	case 49: case 63: return "GOR1A0";	//hanging victim, twitching
+	case 50: case 59: return "GOR2A0";	//hanging victim, arms out
+	case 51: case 61: return "GOR3A0";	//hanging victim, one-legged
+	case 52: case 60: return "GOR4A0";	//hanging pair of legs
+	case 53: case 62: return "GOR5A0";	//hanging leg
+	//hanging torsos, HDB sprites (ceiling, Doom 2)
+	case 73:   return "HDB1A0";	case 74:   return "HDB2A0";
+	case 75:   return "HDB3A0";	case 76:   return "HDB4A0";
+	case 77:   return "HDB5A0";	case 78:   return "HDB6A0";
+	//dead bodies (corpse decorations)
+	case 15:   return "PLAYN0";	//dead player
+	case 10: case 12: return "PLAYW0";	//gibbed player ("bloody mess")
 	default: return NULL;
 	}
 }
@@ -2370,6 +2475,21 @@ static qboolean Doom_IsPickup(unsigned short type)
 		return true;
 	default:
 		return false;	//decorations / obstacles
+	}
+}
+
+//hanging corpses (GOR*/HDB*) spawn from the ceiling, not the floor (Doom's SPAWNCEILING flag).
+//We anchor their billboard/model so the top touches the ceiling (origin = ceiling - height); the
+//upward-drawn billboard then spans [ceiling-h, ceiling], hanging correctly.
+static qboolean Doom_ThingHangs(unsigned short type)
+{
+	switch(type)
+	{
+	case 49: case 50: case 51: case 52: case 53:	//GOR* solid
+	case 59: case 60: case 61: case 62: case 63:	//GOR* non-solid
+	case 73: case 74: case 75: case 76: case 77: case 78:	//HDB* (Doom 2)
+		return true;
+	default: return false;
 	}
 }
 
@@ -2407,7 +2527,10 @@ static void Doom_LoadThingSprites(doommap_t *dm)
 		sec = Doom_SectorNearPoint(dm, p);
 		out->origin[0] = p[0];
 		out->origin[1] = p[1];
-		out->origin[2] = sec ? sec->floorheight : 0;
+		if (Doom_ThingHangs(dm->thing[i].type) && sec)
+			out->origin[2] = sec->ceilingheight - sh;	//hang from the ceiling (top at ceiling)
+		else
+			out->origin[2] = sec ? sec->floorheight : 0;
 		out->w = sw; out->h = sh; out->xo = sxo; out->yo = syo;
 		out->pickup = Doom_IsPickup(dm->thing[i].type);
 		out->type = dm->thing[i].type;
@@ -2914,7 +3037,7 @@ void Doom_ResetMap(model_t *model)
 		m->mstate = 0;
 		m->alerted = 0;
 		m->deathtime = -1;
-		m->paintime = -1; m->atktime = -1; m->vilet = -1; m->risetime = -1; m->exploded = 0;
+		m->paintime = -1; m->atktime = -1; m->vilet = -1; m->risetime = -1; m->exploded = 0; m->gibbed = 0;
 		m->atkcool = 0.5f + (rand()&255)/128.0f;
 	}
 	dm->numprojectiles = 0;
@@ -3040,23 +3163,62 @@ static const char *Doom_MonSound(const char *spr, int ev)
 	return (ev==1)?"DSPOPAIN":(ev==2)?"DSPODTH1":NULL;
 }
 
-static void Doom_HurtMonster(struct doommonster_s *m, int damage)
+//transient FX types queued on dm->fx, emitted as particles client-side (Doom_EmitFX)
+#define DFX_BLOOD     0
+#define DFX_GIB       1
+#define DFX_EXPLOSION 2
+static void Doom_AddFX(doommap_t *dm, const vec3_t org, int type)
+{	//queue a one-shot effect; the client render drains this each frame
+	if (!dm || dm->numfx >= (int)(sizeof(dm->fx)/sizeof(dm->fx[0]))) return;
+	VectorCopy(org, dm->fx[dm->numfx].org);
+	dm->fx[dm->numfx].type = (qbyte)type;
+	dm->numfx++;
+}
+//client render: spawn each queued effect's particles once, then clear the queue. Uses FTE's
+//built-in Quake-style effects (TE_BLOOD / TE_EXPLOSION) so no Quake data files are needed.
+static void Doom_EmitFX(doommap_t *dm)
 {
+	int i; vec3_t up = {0,0,1};
+	for (i = 0; i < dm->numfx; i++)
+	{
+		switch (dm->fx[i].type)
+		{
+		//blood: classic Quake colored-particle builtin (palette 73 = dark-red blood ramp). The named
+		//"TE_BLOOD" effect only exists in DarkPlaces, so we use the always-available builtin instead.
+		case DFX_BLOOD:     P_RunParticleEffect(dm->fx[i].org, up, 73, 16); break;
+		case DFX_GIB:       P_RunParticleEffect(dm->fx[i].org, up, 73, 90); break;	//big spray on a gib kill
+		case DFX_EXPLOSION: P_RunParticleEffectTypeString(dm->fx[i].org, up, 1, "TE_EXPLOSION"); break;
+		}
+	}
+	dm->numfx = 0;
+}
+
+static void Doom_HurtMonster(doommap_t *dm, struct doommonster_s *m, int damage)
+{
+	vec3_t hit;
 	if (m->mstate == 2) return;
 	m->health -= damage;
 	m->alerted = 1;
+	VectorSet(hit, m->origin[0], m->origin[1], m->origin[2]+32);	//blood at roughly chest height
 	if (m->health <= 0)
 	{
 		m->mstate = 2;
 		m->deathtime = 0;
+		//overkill (vanilla: health < -spawnhealth) bursts the monster into gibs instead of a corpse
+		m->gibbed = (m->spawnhealth > 0 && m->health < -m->spawnhealth) ? 1 : 0;
 		if (!(m->atk & MATK_BARREL))	//barrels play DSBAREXP from Doom_BarrelExplode instead
+		{
 			Doom_PlaySound(m->origin, Doom_MonSound(m->spr,2));
+			Doom_AddFX(dm, hit, m->gibbed ? DFX_GIB : DFX_BLOOD);	//death spray (big if gibbed)
+		}
 	}
 	else
 	{
 		if (m->painfr[0])
 			m->paintime = 0;	//trigger pain animation (100% chance for now, vanilla is random)
 		Doom_PlaySound(m->origin, Doom_MonSound(m->spr,1));
+		if (!(m->atk & MATK_BARREL))
+			Doom_AddFX(dm, hit, DFX_BLOOD);	//blood spurt on every hit
 	}
 }
 
@@ -3085,7 +3247,7 @@ void Doom_RadiusDamage(doommap_t *dm, const vec3_t org, float radius, float dama
 		if (dist < radius)
 		{
 			dmg = damage - dist;
-			if (dmg > 0) Doom_HurtMonster(o, (int)dmg);
+			if (dmg > 0) Doom_HurtMonster(dm, o, (int)dmg);
 		}
 	}
 }
@@ -3226,7 +3388,7 @@ static void Doom_TickProjectiles(doommap_t *dm, float frametime, const vec3_t pl
 				{
 					if (pr->owner != 0)
 					{
-						Doom_HurtMonster(m, pr->damage * Doom_Rand(1,8));
+						Doom_HurtMonster(dm, m, pr->damage * Doom_Rand(1,8));
 						dead = true; break;
 					}
 				}
@@ -3240,7 +3402,8 @@ static void Doom_TickProjectiles(doommap_t *dm, float frametime, const vec3_t pl
 		{
 			if (dead && pr->type == 1) //Rocket explosion
 				Doom_RadiusDamage(dm, np, 128, 128, playerorg, playerhealth, playerarmor);
-			if (dead && pr->type == 3) //BFG blast
+			if (dead && pr->type != 4 && pr->type != 5) Doom_AddFX(dm, np, DFX_EXPLOSION); //Quake-style explosion particles (no explosion model in the pack)
+				if (dead && pr->type == 3) //BFG blast
 			{
 				Doom_RadiusDamage(dm, np, 128, 128, playerorg, playerhealth, playerarmor);
 				Doom_BFGSpray(dm, playerorg);
@@ -3576,7 +3739,7 @@ void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, 
 				if (m->risetime >= m->ndeath * 0.07f)
 				{
 					m->mstate = 0; m->health = m->spawnhealth; m->alerted = 1;
-					m->deathtime = -1; m->risetime = -1; m->atktime = -1; m->paintime = -1; m->exploded = 0;
+					m->deathtime = -1; m->risetime = -1; m->atktime = -1; m->paintime = -1; m->exploded = 0; m->gibbed = 0;
 				}
 				continue;
 			}
@@ -3649,8 +3812,8 @@ void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, 
 			for (k = 0; k < dm->nummonsters; k++)
 			{
 				struct doommonster_s *c = &dm->monsters[k];
-				if (c->mstate == 2 && c->risetime < 0 && c->ndeath > 0 && !(c->atk & MATK_BARREL)
-					&& c->deathtime >= (c->ndeath-1)*0.15f)	//only a fully-settled corpse (on its last frame)
+				if (c->mstate == 2 && c->risetime < 0 && c->ndeath > 0 && !(c->atk & MATK_BARREL) && !c->gibbed
+					&& c->deathtime >= (c->ndeath-1)*0.15f)	//only a fully-settled, un-gibbed corpse (on its last frame)
 				{
 					float cdx = c->origin[0]-m->origin[0], cdy = c->origin[1]-m->origin[1];
 					if (cdx*cdx+cdy*cdy < 64*64)
@@ -3910,7 +4073,7 @@ void Doom_PlayerAttack(model_t *model, const vec3_t org, float yaw, int pellets,
 		if (best != ~0u)
 		{
 			struct doommonster_s *m = &dm->monsters[best];
-			Doom_HurtMonster(m, Doom_Rand(1,3) * dmgbase);
+			Doom_HurtMonster(dm, m, Doom_Rand(1,3) * dmgbase);
 		}
 	}
 	Doom_NoiseAlert(dm, org);	//the gunshot wakes monsters within sound range
@@ -4022,7 +4185,9 @@ static void Doom_BuildVoxel(doomvoxel_t *v, const char *name)
 		if(!Doom_VoxSolid(solid,sx,sy,sz,x-1,y,z))faces++; if(!Doom_VoxSolid(solid,sx,sy,sz,x+1,y,z))faces++;
 		if(!Doom_VoxSolid(solid,sx,sy,sz,x,y-1,z))faces++; if(!Doom_VoxSolid(solid,sx,sy,sz,x,y+1,z))faces++;
 		if(!Doom_VoxSolid(solid,sx,sy,sz,x,y,z-1))faces++; if(!Doom_VoxSolid(solid,sx,sy,sz,x,y,z+1))faces++; }
-	if (faces>16250) faces=16250;	//cap: immediate-mode meshes / 16-bit indices stay under 65536 verts
+	//no face cap: large voxels (e.g. the ELEC techno column) are drawn in <64k-vert chunks by
+	//Doom_DrawVoxel, so they don't truncate (which previously left such pillars half-built). v->idx
+	//below may hold >16bit values for huge voxels but is unused - the draw path uses a shared chunk index.
 	if (faces)
 	{
 		v->xyz=BZ_Malloc(faces*4*sizeof(vecV_t));
@@ -4069,20 +4234,38 @@ static doomvoxel_t *Doom_GetVoxel(const char *name)
 	return &doomvox[doomvoxcount++];
 }
 
+#define VOXCHUNK_QUADS 8192	//8192 quads = 32768 verts < 65535: indices fit in 16-bit, with margin
+static index_t *doomvoxchunkidx;	//shared per-chunk index pattern (0,1,2,0,2,3 per quad), 16-bit-safe
 static void Doom_DrawVoxel(doomvoxel_t *v, const vec3_t origin, float yawdeg, float scale)
-{	//rotate the cached local mesh by yaw into world space and draw it (opaque, vertex-coloured)
-	mesh_t mesh; int i; float c,s,a=(yawdeg+v->angleoffset)*(M_PI/180.0);
+{	//rotate the cached local mesh by yaw into world space and draw it (opaque, vertex-coloured).
+	//Drawn in <64k-vertex chunks so voxels with more than ~16k faces (e.g. ELEC) render fully under
+	//this build's 16-bit indices instead of truncating to half a model.
+	mesh_t mesh; int i, q, nq; float c,s,a=(yawdeg+v->angleoffset)*(M_PI/180.0);
 	c=cos(a); s=sin(a);
 	if (v->nverts>doomvoxscap){ doomvoxscap=v->nverts+256;
 		doomvoxsxyz=BZ_Realloc(doomvoxsxyz,doomvoxscap*sizeof(vecV_t));
 		doomvoxsst =BZ_Realloc(doomvoxsst, doomvoxscap*sizeof(vec2_t));
 		memset(doomvoxsst,0,doomvoxscap*sizeof(vec2_t)); }
+	if (!doomvoxchunkidx)	//build the reusable 0-based quad index pattern once
+	{
+		doomvoxchunkidx=BZ_Malloc(VOXCHUNK_QUADS*6*sizeof(index_t));
+		for (i=0;i<VOXCHUNK_QUADS;i++){ index_t b=(index_t)(i*4);
+			doomvoxchunkidx[i*6+0]=b; doomvoxchunkidx[i*6+1]=b+1; doomvoxchunkidx[i*6+2]=b+2;
+			doomvoxchunkidx[i*6+3]=b; doomvoxchunkidx[i*6+4]=b+2; doomvoxchunkidx[i*6+5]=b+3; }
+	}
 	for (i=0;i<v->nverts;i++){ float lx=v->xyz[i][0]*scale, ly=v->xyz[i][1]*scale, lz=v->xyz[i][2]*scale;
 		doomvoxsxyz[i][0]=origin[0]+lx*c-ly*s; doomvoxsxyz[i][1]=origin[1]+lx*s+ly*c; doomvoxsxyz[i][2]=origin[2]+lz; }
 	memset(&mesh,0,sizeof(mesh));
-	mesh.numvertexes=v->nverts; mesh.numindexes=v->nidx;
-	mesh.xyz_array=doomvoxsxyz; mesh.st_array=doomvoxsst; mesh.colors4b_array=v->col; mesh.indexes=v->idx;
-	BE_DrawMesh_Single(doomvoxshader,&mesh,NULL,0);
+	mesh.st_array=doomvoxsst;	//1x1 white texture + rgbgen vertex, so texcoords are unused (all zero)
+	mesh.indexes=doomvoxchunkidx;
+	nq=v->nverts/4;			//total quads
+	for (q=0; q<nq; q+=VOXCHUNK_QUADS)
+	{
+		int cq = (nq-q < VOXCHUNK_QUADS) ? (nq-q) : VOXCHUNK_QUADS;
+		mesh.numvertexes=cq*4; mesh.numindexes=cq*6;
+		mesh.xyz_array=doomvoxsxyz + q*4; mesh.colors4b_array=v->col + q*4;
+		BE_DrawMesh_Single(doomvoxshader,&mesh,NULL,0);
+	}
 }
 
 static void Doom_VoxShader(void)
@@ -4103,6 +4286,181 @@ static qboolean Doom_DrawVoxelByName(const char *name, const vec3_t origin, floa
 	return true;
 }
 
+//----- MD2 monster models -------------------------------------------------------
+// Optional per-monster MD2 models (Vavoom xmodels.pk3, converted to doommodels.def
+// by tools/models/convert_xmodels.py).  Keyed by sprite prefix (POSS/SPOS/TROO);
+// each phase (walk/attack/pain/die) carries the raw MD2 frame list, and the engine
+// maps its own phase frame index into that list.  FTE loads the .md2 + embedded
+// PCX skin natively; we extract the posed verts for the frame and draw the same
+// way as voxels (CPU yaw-rotate + BE_DrawMesh_Single with a skin shader).  Falls
+// back to voxel/sprite for any monster without a def.
+typedef struct {
+	char     spr[8];		// sprite-prefix key (POSS/SPOS/TROO)
+	char     mdl[3][64];		// slot file paths: 0=base 1=die 2=gib
+	qboolean modtried[3];		// load attempted (even if it failed)
+	model_t *mod[3];		// loaded models (NULL until loaded/failed)
+	shader_t*sh[3];			// per-slot skin shader (from the MD2's embedded skin)
+	qbyte    phslot[DMDL_NUMPH];	// which md2 slot each phase uses
+	qbyte    phcount[DMDL_NUMPH];	// frames in the phase list
+	short    phframe[DMDL_NUMPH][16];
+} doommodel_t;
+static doommodel_t *doommodels; static int doommodelcount; static qboolean doommodelsloaded;
+static vecV_t *doommdlxyz; static byte_vec4_t *doommdlcol; static int doommdlcap;	// world-transform scratch
+
+static int Doom_ModelPhase(const char *t)
+{
+	if (!strcmp(t,"walk"))   return DMDL_WALK;
+	if (!strcmp(t,"attack")) return DMDL_ATTACK;
+	if (!strcmp(t,"pain"))   return DMDL_PAIN;
+	if (!strcmp(t,"die"))    return DMDL_DIE;
+	if (!strcmp(t,"gib"))    return DMDL_GIB;
+	return -1;
+}
+static int Doom_ModelSlotIdx(const char *t)
+{
+	if (!strcmp(t,"base")) return 0;
+	if (!strcmp(t,"die"))  return 1;
+	if (!strcmp(t,"gib"))  return 2;
+	return -1;
+}
+static void Doom_LoadModelDef(void)
+{	//parse doommodels.def (generated from xmodels.pk3) into the model cache
+	char *file, *data; size_t sz=0; doommodel_t *cur=NULL;
+	if (doommodelsloaded) return;
+	doommodelsloaded=true;
+	file=FS_LoadMallocFile("doommodels.def",&sz);
+	if (!file) return;
+	data=file;
+	for (;;)
+	{
+		int ph, slot;
+		data=COM_Parse(data); if (!data||!com_token[0]) break;	//keyword
+		if (!strcmp(com_token,"model"))
+		{
+			data=COM_Parse(data); if(!data) break;
+			doommodels=BZ_Realloc(doommodels,(doommodelcount+1)*sizeof(*doommodels));
+			cur=&doommodels[doommodelcount++]; memset(cur,0,sizeof(*cur));
+			Q_strncpyz(cur->spr,com_token,sizeof(cur->spr));
+		}
+		else if (!strcmp(com_token,"mdl") && cur)
+		{
+			data=COM_Parse(data); if(!data) break; slot=Doom_ModelSlotIdx(com_token);
+			data=COM_Parse(data); if(!data) break;
+			if (slot>=0) Q_strncpyz(cur->mdl[slot],com_token,sizeof(cur->mdl[0]));
+		}
+		else if (cur && (ph=Doom_ModelPhase(com_token))>=0)
+		{
+			data=COM_Parse(data); if(!data) break; slot=Doom_ModelSlotIdx(com_token);
+			cur->phslot[ph]=(slot<0)?0:slot; cur->phcount[ph]=0;
+			for (;;)	//read the numeric frame list; stop at the next (non-numeric) keyword
+			{
+				char *save=data;
+				data=COM_Parse(data); if(!data||!com_token[0]) break;
+				if (com_token[0]<'0'||com_token[0]>'9'){ data=save; break; }
+				if (cur->phcount[ph]<16) cur->phframe[ph][cur->phcount[ph]++]=(short)atoi(com_token);
+			}
+		}
+		//unknown token: ignore (file is generated, so this shouldn't happen)
+	}
+	BZ_Free(file);
+}
+static doommodel_t *Doom_GetModel(const char *spr)
+{
+	int i; Doom_LoadModelDef();
+	for (i=0;i<doommodelcount;i++) if(!strcmp(doommodels[i].spr,spr)) return &doommodels[i];
+	return NULL;
+}
+static qboolean Doom_ModelSlot(doommodel_t *dm, int slot, model_t **pmod, shader_t **psh)
+{	//lazily load the slot's MD2 + build a shader for its embedded skin
+	if (!dm->modtried[slot])
+	{
+		dm->modtried[slot]=true;
+		if (dm->mdl[slot][0])
+		{
+			//MLV_WARNSYNC: block until the load finishes. FTE loads models on a worker thread, so
+			//the default MLV_WARN would leave loadstate==MLS_LOADING here. Safe: this only runs at
+			//map-load (Doom_PreloadModels, on WG_MAIN), never mid-render.
+			model_t *mod=Mod_ForName(dm->mdl[slot],MLV_WARNSYNC);
+			if (mod && mod->type==mod_alias && mod->loadstate==MLS_LOADED)
+			{
+				galiasinfo_t *inf=Mod_Extradata(mod);
+				const char *skin = (inf && inf->numskins>0 && inf->ofsskins &&
+						    inf->ofsskins[0].numframes>0 && inf->ofsskins[0].frame)
+						   ? inf->ofsskins[0].frame[0].shadername : NULL;
+				dm->mod[slot]=mod;
+				if (skin && skin[0])
+				{	//opaque, vertex-coloured (white), double-sided; texture is the MD2 skin (pcx)
+					char body[320], shname[80];
+					Q_snprintfz(shname,sizeof(shname),"doom_mdl/%s",skin);
+					Q_snprintfz(body,sizeof(body),
+						"{\ncull none\n{\nmap \"%s\"\nrgbgen vertex\n}\n}\n",skin);
+					dm->sh[slot]=R_RegisterShader(shname,SUF_NONE,body);
+				}
+			}
+		}
+	}
+	if (!dm->mod[slot] || !dm->sh[slot]) return false;
+	*pmod=dm->mod[slot]; *psh=dm->sh[slot]; return true;
+}
+void Doom_PreloadModels(void)
+{	//load every MD2 def's slots up front (at map-load, main thread) so the synchronous loads
+	//never happen mid-render. Cheap (a handful of small models); skips any that fail to load.
+	int i, slot; model_t *m; shader_t *s;
+	if (!(int)Cvar_Get("doom_models", "1", CVAR_ARCHIVE, "Doom")->value)
+		return;	//models disabled - don't pay the load cost
+	Doom_LoadModelDef();
+	for (i=0;i<doommodelcount;i++)
+		for (slot=0;slot<3;slot++)
+			if (doommodels[i].mdl[slot][0])
+				Doom_ModelSlot(&doommodels[i], slot, &m, &s);
+}
+static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
+{	//render the monster's MD2 for the given phase/frame; false -> caller falls back to voxel/sprite
+	doommodel_t *dm=Doom_GetModel(spr);
+	galiasinfo_t *inf; galiaspose_t *pose; model_t *mod=NULL; shader_t *sh=NULL;
+	int slot, listlen, li, frame, i, nv; mesh_t mesh; float c,s,a;
+	if (!dm || phase<0 || phase>=DMDL_NUMPH) return false;
+	listlen=dm->phcount[phase]; if (listlen<=0) return false;
+	slot=dm->phslot[phase];
+	if (!Doom_ModelSlot(dm,slot,&mod,&sh)) return false;
+	inf=Mod_Extradata(mod); if (!inf || inf->numanimations<=0 || inf->numverts<=0) return false;
+	if (count==0)
+		li = ((idx%listlen)+listlen)%listlen;	//wrap: step idx through the list looping (idle/spin decorations)
+	else if (count<0)
+		li = (idx<0)?0:(idx>=listlen?listlen-1:idx);	//clamp & hold last: play frames 0..n-1 then freeze (barrel explosion)
+	else
+	{	//map quoom's phase frame index evenly into the raw MD2 list (monster phases)
+		li = (count>1) ? (idx*listlen)/count : (idx<listlen?idx:0);
+		if (li<0) li=0; if (li>=listlen) li=listlen-1;
+	}
+	frame=dm->phframe[phase][li];
+	if (frame<0 || frame>=inf->numanimations) return false;
+	if (!inf->ofsanimations[frame].numposes) return false;
+	pose=&inf->ofsanimations[frame].poseofs[0];
+	nv=inf->numverts;
+	if (nv>doommdlcap)
+	{
+		doommdlcap=nv+256;
+		doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
+		doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
+		memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
+	}
+	a=yawdeg*(M_PI/180.0); c=cos(a); s=sin(a);
+	for (i=0;i<nv;i++)
+	{	//MD2 model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to feet
+		float lx=pose->ofsverts[i][0]*scale, ly=pose->ofsverts[i][1]*scale, lz=pose->ofsverts[i][2]*scale;
+		doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
+		doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
+		doommdlxyz[i][2]=origin[2]+lz;
+	}
+	memset(&mesh,0,sizeof(mesh));
+	mesh.numvertexes=nv; mesh.numindexes=inf->numindexes;
+	mesh.xyz_array=doommdlxyz; mesh.st_array=inf->ofs_st_array;
+	mesh.colors4b_array=doommdlcol; mesh.indexes=inf->ofs_indexes;
+	BE_DrawMesh_Single(sh,&mesh,NULL,0);
+	return true;
+}
+
 //draw monsters as upright camera-facing billboards (same technique as R_DoomDrawSprites).
 static void R_DoomDrawMonsters(doommap_t *dm)
 {
@@ -4115,8 +4473,8 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 	byte_vec4_t col[4];
 	index_t idx[6] = {0,1,2, 0,2,3};
 
-	int sprrot, sprfreeze, usevox;
-	float voxscale, voxyaw;
+	int sprrot, sprfreeze, usevox, usemod;
+	float voxscale, voxyaw, modscale, modyaw, modz;
 	if (!dm->nummonsters && !dm->numprojectiles)
 		return;
 	sprrot = (int)Cvar_Get("doom_sprrot", "1", CVAR_ARCHIVE, "Doom Sprites")->value;	//1=8-way+mirror, 0=front only
@@ -4124,6 +4482,10 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 	usevox  = (int)Cvar_Get("doom_voxels", "1", CVAR_ARCHIVE, "Doom")->value;	//1=voxel models, 0=sprites
 	voxscale= Cvar_Get("doom_voxscale", "1", CVAR_ARCHIVE, "Doom")->value;		//world units per voxel
 	voxyaw  = Cvar_Get("doom_voxyaw", "90", CVAR_ARCHIVE, "Doom")->value;		//facing offset (deg) for tuning
+	usemod  = (int)Cvar_Get("doom_models", "1", CVAR_ARCHIVE, "Doom")->value;	//1=MD2 models (where a def exists) take priority over voxels
+	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;		//MD2 scale (Vavoom models are ~1:1 with map units)
+	modyaw  = Cvar_Get("doom_modyaw", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 facing offset (deg); 0 after the +90 voxel default was rotated 90 CW to match these models
+	modz    = Cvar_Get("doom_modz", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 vertical offset (deg) for tuning
 	if (usevox) Doom_VoxShader();
 	viewang[0]=0; viewang[1]=r_refdef.viewangles[1]; viewang[2]=0;
 	AngleVectors(viewang, vpn, vright, vup);
@@ -4138,6 +4500,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		struct doommonster_s *m = &dm->monsters[i];
 		shader_t *sh = NULL; short sw=0, shh=0, sxo=0, syo=0; qboolean mirror=false;
 		const char *vbase=m->spr; char vlet=0;	//voxel name = vbase+vlet for the current frame
+		int mph=-1, midx=0, mcount=1;		//MD2 phase / frame index / frame count for this monster
 		float zb, zt; vec3_t l, r;
 		if (m->mstate == 2)
 		{	//dead: play death animation - or, if an archvile is raising it, the death frames in REVERSE
@@ -4156,6 +4519,14 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 				}
 			}
 			if (df < 0 || df >= m->ndeath) continue;
+			mph=DMDL_DIE; midx=df; mcount=m->ndeath;
+			//the barrel's explosion model has fewer frames than the 5-frame BEXP sprite seq, so the
+			//proportional mapping would flash the climactic frame only at the very end. Clamp-hold
+			//(mcount<0) instead: advance frames 0,1,2 one per death step, then hold the peak fireball.
+			if (m->atk & MATK_BARREL) mcount = -1;
+			//overkill: play the gib model (xdeath) if this monster has one, clamp-hold to the gib pile.
+			//(sprite path keeps the death frames - no gib sprites are loaded - so this is the MD2 win.)
+			if (m->gibbed) { mph=DMDL_GIB; mcount=-1; }
 			sh = m->deathfr[df]; sw = m->dfw[df]; shh = m->dfh[df]; sxo = m->dfxo[df]; syo = 0;
 			{ const char *ds=(m->atk&MATK_BARREL)?"ABCDE":Doom_DeathSeq(m->spr);
 			  if(m->atk&MATK_BARREL)vbase="BEXP"; if(ds&&df<(int)strlen(ds))vlet=ds[df]; }
@@ -4164,6 +4535,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		{	//pain: play the flinch frame for its loaded length
 			int pf = (int)(m->paintime / 0.1f);
 			if (pf >= m->npain) { m->paintime = -1; pf = 0; } //end pain
+			mph=DMDL_PAIN; midx=pf; mcount=m->npain;
 			sh = m->painfr[pf]; sw = m->pfw[pf]; shh = m->pfh[pf]; sxo = m->pfxo[pf]; syo = 0;
 			vlet = Doom_PainFrame(m->spr);
 		}
@@ -4172,6 +4544,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			//matches vanilla timing (former-human missile is ~0.74s) instead of flashing past in 0.3s.
 			int af = (int)(m->atktime / 0.25f);
 			if (af >= m->natk) { m->atktime = -1; af = 0; } //end attack
+			mph=DMDL_ATTACK; midx=af; mcount=m->natk;
 			if (m->atkfr[af]) {
 				sh = m->atkfr[af]; sw = m->afw[af]; shh = m->afh[af]; sxo = m->afxo[af]; syo = 0;
 			}
@@ -4181,6 +4554,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		{	//alive: pick walk frame and rotation
 			int wf = (m->alerted && m->nwalk > 1) ? ((int)(m->animt / 0.25f) % m->nwalk) : 0;
 			if (sprfreeze >= 0) wf = sprfreeze % m->nwalk;	//diagnostic: hold a single walk frame
+			mph=DMDL_WALK; midx=wf; mcount=m->nwalk;
 			//pick rotation (0-7) based on monster yaw vs view angle
 			float ang = m->yaw - viewang[1] + 180 + 22.5f;
 			int rot = ((int)(ang / 45.0f)) & 7;
@@ -4191,11 +4565,20 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 				vlet = ((int)(m->animt/0.17f)&1) ? 'B' : 'A';
 			else { const char *ws=Doom_WalkFrames(m->spr); if(ws&&wf<(int)strlen(ws))vlet=ws[wf]; }
 		}
+		if ((usemod || usevox) && mph>=0)
+		{	//behind-camera cull (the model/voxel draw is heavier than a billboard)
+			vec3_t tom;
+			VectorSubtract(m->origin, r_refdef.vieworg, tom);
+			if (DotProduct(tom, vpn) < -96) continue;
+		}
+		if (usemod && mph>=0)
+		{	//MD2 model for this monster+phase, if a def exists; else fall through to voxel/sprite
+			vec3_t mo; VectorCopy(m->origin, mo); mo[2]+=modz;
+			if (Doom_DrawModel(m->spr, mph, midx, mcount, mo, m->yaw+modyaw, modscale)) continue;
+		}
 		if (usevox && vlet && vbase)
 		{	//voxel model for this frame, if one exists; otherwise fall through to the sprite
-			char vn[16]; vec3_t tom;
-			VectorSubtract(m->origin, r_refdef.vieworg, tom);
-			if (DotProduct(tom, vpn) < -96) continue;	//behind the camera: skip the (heavy) voxel draw
+			char vn[16];
 			Q_snprintfz(vn,sizeof(vn),"%s%c",vbase,vlet);
 			if (Doom_DrawVoxelByName(vn, m->origin, m->yaw+voxyaw, voxscale)) continue;
 		}
@@ -4334,6 +4717,7 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 	//item/decoration billboards: resolve sprites now that textures+geometry are ready
 	Doom_LoadThingSprites(dm);
 	Doom_LoadMonsters(dm);
+	Doom_PreloadModels();	//load MD2 monster models now (main thread) so render-time loads never block
 };
 
 static void Doom_Purge (struct model_s *mod)
@@ -4357,6 +4741,7 @@ static void Doom_Purge (struct model_s *mod)
 	dm->nummonsters = 0;
 	doomvoxshader = NULL;	//shader system is reset between maps; rebuilt lazily on next draw
 	doomhudpiccount = 0;	//HUD patch shaders are also reset between maps
+	BZ_Free(doommodels); doommodels=NULL; doommodelcount=0; doommodelsloaded=false;	//MD2 defs/skin shaders reload next map
 	BZ_Free(dm->projectiles);
 	dm->projectiles = NULL;
 	dm->numprojectiles = 0;
@@ -4674,7 +5059,7 @@ void QuakifyThings(doommap_t *dm)
 			doom_player1_start[0] = dm->thing[i].xpos;
 			doom_player1_start[1] = dm->thing[i].ypos;
 			doom_player1_start[2] = zpos;
-			doom_player1_yaw = dm->thing[i].angle;
+			doom_player1_yaw = dm->thing[i].angle;	//Doom thing angle == Quake yaw (0=E,90=N) - face the map's start angle
 		}
 
 		spawnflags = SPAWNFLAG_NOT_EASY | SPAWNFLAG_NOT_MEDIUM | SPAWNFLAG_NOT_HARD | SPAWNFLAG_NOT_DEATHMATCH;
