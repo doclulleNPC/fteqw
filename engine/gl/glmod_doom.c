@@ -4919,28 +4919,54 @@ void Doom_DrawViewModel(void)
 	if (!mod || !sh) return;
 	inf=Mod_Extradata(mod); if (!inf) return;
 
-	scale     = Cvar_Get("doom_vm_scale","1",CVAR_ARCHIVE,"Doom")->value;
-	ofwd      = Cvar_Get("doom_vm_fwd","8",CVAR_ARCHIVE,"Doom")->value;	//forward from the eye
-	oright    = Cvar_Get("doom_vm_right","0",CVAR_ARCHIVE,"Doom")->value;
-	oup       = Cvar_Get("doom_vm_up","-8",CVAR_ARCHIVE,"Doom")->value;	//down from the eye
+	scale     = Cvar_Get("doom_vm_scale","1.4",CVAR_ARCHIVE,"Doom")->value;	//overall size multiplier (after per-model normalisation)
+	ofwd      = Cvar_Get("doom_vm_fwd","10",CVAR_ARCHIVE,"Doom")->value;	//forward from the eye
+	oright    = Cvar_Get("doom_vm_right","3",CVAR_ARCHIVE,"Doom")->value;	//+ = to the right
+	oup       = Cvar_Get("doom_vm_up","-10",CVAR_ARCHIVE,"Doom")->value;	//- = position of the weapon's TOP below the eye
 	lowerdist = Cvar_Get("doom_vm_lower","40",CVAR_ARCHIVE,"Doom")->value;	//switch drop distance
 
-	AngleVectors(r_refdef.viewangles, fwd, right, up);
-	VectorMA(r_refdef.vieworg, ofwd, fwd, base);
-	VectorMA(base, oright, right, base);
-	VectorMA(base, oup - doomvm_off*lowerdist, up, base);
-
 	frame = (fi>0 && fi<inf->numanimations) ? fi : 0;	//STAT_WEAPONFRAME -> view.md2 frame (0=idle)
-	//normal depth (beflags 0): the model self-occludes correctly and, being right at the camera,
-	//still draws over the world (it only clips when the eye is jammed into a wall - acceptable).
-	Doom_DrawVMMesh(mod, sh, frame, base, fwd, right, up, scale, 0);
+
+	//The xmodels view models are authored at wildly different native scales (the pistol is ~35 units
+	//but the fists are ~158), so a single scale makes some gigantic. Normalise each weapon to a
+	//consistent on-screen size from its own bounds, then centre it on the screen plane. doom_vm_scale
+	//is an overall multiplier on top of that; the offsets place the centred weapon (lower-right).
+	{
+		galiaspose_t *p = (frame<inf->numanimations && inf->ofsanimations[frame].numposes)
+		                  ? &inf->ofsanimations[frame].poseofs[0] : NULL;
+		float mn[3]={1e9f,1e9f,1e9f}, mx[3]={-1e9f,-1e9f,-1e9f}; int i,k;
+		float eff = scale, cy=0, sizeref;
+		if (p)
+		{
+			for (i=0;i<inf->numverts;i++) for (k=0;k<3;k++)
+			{ float v=p->ofsverts[i][k]; if(v<mn[k])mn[k]=v; if(v>mx[k])mx[k]=v; }
+			sizeref = (mx[1]-mn[1] > mx[2]-mn[2]) ? (mx[1]-mn[1]) : (mx[2]-mn[2]);	//screen-plane extent
+			if (sizeref < 1) sizeref = 1;
+			eff = scale * (22.0f / sizeref);	//normalise: target ~22 units on the screen plane
+			cy  = (mn[1]+mx[1])*0.5f;	//horizontal centroid only
+		}
+		AngleVectors(r_refdef.viewangles, fwd, right, up);
+		VectorMA(r_refdef.vieworg, ofwd, fwd, base);
+		VectorMA(base, oright, right, base);
+		VectorMA(base, oup - doomvm_off*lowerdist, up, base);
+		VectorMA(base,  eff*cy, right, base);	//centre HORIZONTALLY only (Y -> -right, so +cy)
+		if (p) VectorMA(base, -eff*mx[2], up, base);	//anchor the weapon's TOP at oup, so scaling grows it
+							//in place (arm extends further off-bottom) instead of sliding it down
+		if (p) { float nearfwd = ofwd + mn[0]*eff;	//keep the nearest point off the near clip plane
+		         if (nearfwd < 8.0f) VectorMA(base, 8.0f-nearfwd, fwd, base); }
+		scale = eff;	//draw with the normalised scale (also used for the flash, kept aligned)
+	}
+
+	//draw on top of the world (BEF_FORCENODEPTH) so it never vanishes behind the floor when you look
+	//down, nor clips into nearby geometry - exactly like the 2D HUD weapon sprite it replaces.
+	Doom_DrawVMMesh(mod, sh, frame, base, fwd, right, up, scale, BEF_FORCENODEPTH);
 
 	//muzzle flash (additive) on fire frames, only when fully raised
 	if (doomvm[wi].flash && doomvm[wi].fsh && doomvm_off<=0 && fi>0)
 	{
 		galiasinfo_t *fin = Mod_Extradata(doomvm[wi].flash);
 		int ff = (fin && (fi-1)<fin->numanimations) ? (fi-1) : 0;
-		Doom_DrawVMMesh(doomvm[wi].flash, doomvm[wi].fsh, ff, base, fwd, right, up, scale, BEF_FORCEADDITIVE);
+		Doom_DrawVMMesh(doomvm[wi].flash, doomvm[wi].fsh, ff, base, fwd, right, up, scale, BEF_FORCENODEPTH|BEF_FORCEADDITIVE);
 	}
 }
 static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
