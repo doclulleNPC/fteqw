@@ -826,6 +826,29 @@ void SV_WipeServerState(void)
 	sv.logindatabase = -1;
 }
 
+#ifdef MAP_DOOM
+static int QDECL SV_DoomPrecacheSound_cb(const char *fname, qofs_t fsize, time_t mtime, void *parm, searchpathfuncs_t *spath)
+{
+	int *pi = parm, j;
+	if (*pi >= MAX_PRECACHE_SOUNDS-1) return false;	//list full: stop
+	if (strchr(fname+4, '/')) return true;		//"wad/DSxxxx" only (no subdirs)
+	for (j = 1; j < *pi; j++)			//skip duplicates
+		if (!strcmp(sv.strings.sound_precache[j], fname)) return true;
+	sv.strings.sound_precache[(*pi)++] = Z_StrDup(fname);
+	return true;
+}
+//Doom has no gamecode, so nothing precaches its sounds: the soundlist sent to clients stays empty,
+//and SV_StartSound's late-precache fails (svprogfuncs is NULL -> no persistent string). Result: no
+//sound at all in Doom mode. Fix: at map-load (ss_loading) precache every wad/DS* sound lump so they
+//ride out in the normal soundlist exactly like Quake's gamecode does it.
+void SV_DoomPrecacheSounds(void)
+{
+	int i = 1;
+	while (i < MAX_PRECACHE_SOUNDS && sv.strings.sound_precache[i]) i++;
+	COM_EnumerateFiles("wad/DS*", SV_DoomPrecacheSound_cb, &i);
+}
+#endif
+
 /*
 ================
 SV_SpawnServer
@@ -1121,7 +1144,12 @@ void SV_SpawnServer (const char *server, const char *startspot, qboolean noents,
 	if (sv.world.worldmodel->type != mod_brush)
 		InfoBuf_SetStarKey(&svs.info, "*bspversion", "");
 	else if (sv.world.worldmodel->fromgame == fg_doom)
+	{
 		InfoBuf_SetStarKey(&svs.info, "*bspversion", "1");
+#ifdef MAP_DOOM
+		SV_DoomPrecacheSounds();	//no gamecode precaches Doom's sounds - do it here or there's no audio
+#endif
+	}
 	else if (sv.world.worldmodel->fromgame == fg_halflife)
 		InfoBuf_SetStarKey(&svs.info, "*bspversion", "30");
 	else if (sv.world.worldmodel->fromgame == fg_quake2)

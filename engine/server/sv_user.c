@@ -49,6 +49,9 @@ void Doom_ActivateLinedef(struct model_s *model, int linedef_idx);
 void Doom_PlayerAttack(struct model_s *model, const float *org, float yaw, int pellets, int dmgbase, float maxrange);
 void Doom_PlayerProjectile(struct model_s *model, const vec3_t org, float yaw, int type);
 void Doom_PlaySound(const vec3_t org, const char *lump);
+void Doom_PlayerFloorSnap(struct model_s *model, float *origin, float *velocity);
+int Doom_DoorKeyMask(int special);
+void Doom_SwitchUse(struct model_s *model, int linedef_idx);
 void Doom_ResetMap(struct model_s *model);
 qboolean Doom_TeleportThing(struct model_s *model, int linedef_idx, float *outorg, float *outyaw);
 void Doom_TryPickups(struct model_s *model, const float *playerorg, float *health, float *armor,
@@ -5816,7 +5819,7 @@ void SV_SetUpClientEdict (client_t *cl, edict_t *ent)
 	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom &&
 		(doom_player1_start[0] || doom_player1_start[1] || doom_player1_start[2]))
 	{
-		Cbuf_AddText("sv_stepheight 24.1\n", 0);
+		Cbuf_AddText("sv_stepheight 24.1\n", RESTRICT_LOCAL);	//level 0 -> "no privileges for pm_stepheight"
 		// VectorCopy(doom_player1_start, ent->v->origin);
 		VectorCopy(doom_player1_start, ent->v->origin);
 		ent->v->angles[1]  = doom_player1_yaw;	//set the view yaw too (see PutClientInServer) so the facing applies
@@ -7875,7 +7878,19 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 		// open on a USE press, or automatically the first frame you face a door on approach
 		// (debounced via doom_autouse_ld so an already-open door isn't re-triggered/oscillated).
 		if (best_ld >= 0 && (useedge || best_ld != host_client->doom_autouse_ld))
-			Doom_ActivateLinedef(sv.world.worldmodel, best_ld);
+		{
+			int keymask = Doom_DoorKeyMask(dm->linedef[best_ld].types);
+			if (keymask && !((int)sv_player->v->items & keymask))
+			{	//locked: missing the required key - don't open (vanilla plays "oof"/"no way")
+				if (useedge)
+					Doom_PlaySound(sv_player->v->origin, "DSNOWAY");
+			}
+			else
+			{
+				Doom_ActivateLinedef(sv.world.worldmodel, best_ld);
+				Doom_SwitchUse(sv.world.worldmodel, best_ld);	//flip the switch texture (no-op for non-switches)
+			}
+		}
 		host_client->doom_autouse_ld = best_ld;
 	}
 	host_client->doom_use_pressed = sv_player->v->button2 ? true : false;
@@ -7922,12 +7937,14 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 					Doom_ActivateLinedef(sv.world.worldmodel, j);
 					// check if it was a one-shot type (crude: most even types are repeating, odd are one-shot?)
 					// better: hardcode common one-shot W1s
-					if (ld->types == 5 || ld->types == 19 || ld->types == 38 || ld->types == 52 || ld->types == 11)
+					if (ld->types == 5 || ld->types == 19 || ld->types == 36 || ld->types == 38 || ld->types == 52 || ld->types == 11)
 						ld->types = 0;
 				}
 				break;	//only one crossing handled per frame
 			}
 		}
+		//ride rising lifts / finish step-ups: lift the player onto the floor they're standing in
+		Doom_PlayerFloorSnap(sv.world.worldmodel, sv_player->v->origin, sv_player->v->velocity);
 		VectorCopy(cur, host_client->doom_prevorg);
 	}
 

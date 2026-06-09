@@ -6,6 +6,7 @@
 
 vec3_t doom_player1_start;
 float  doom_player1_yaw;
+static char doom_mapbase[32];	//current map basename (e.g. "e1m1" / "map01"), for the exit -> next-map
 
 typedef struct doommap_s doommap_t;
 static shader_t *Doom_MonsterSpriteShader(const char *lump, short *w, short *h, short *xo, short *yo);
@@ -245,6 +246,8 @@ typedef struct
 	mesh_t mesh;
 	int maxverts;
 	int maxindicies;
+	shader_t *animframes[12];	//animated flats (NUKAGE1..3, LAVA1..4, ...): cycled each render frame
+	qbyte    nanimframes;		//0 = static
 } doomtexture_t;
 
 typedef struct doommap_s
@@ -305,6 +308,10 @@ typedef struct doommap_s
 	} *doorsectors;
 	unsigned int numactive_doors;
 	unsigned int maxactive_doors;
+
+	//pending switch-texture restores: a used SW1<->SW2 switch flips back after ~1s (Doom BUTTONTIME)
+	struct doomswitchback_s { int sidedef; qbyte which; int origtex; float timer; } switchback[32];
+	int numswitchback;
 
 	// Doom item/decoration sprites, drawn as camera-facing billboards (R_DoomDrawSprites)
 	struct doomsprite_s {
@@ -516,6 +523,7 @@ qboolean Doom_IsActivatableLinedef(int special)
 	case 10: case 88:			// Plat Down-Wait-Up-Stay
 	case 22:				// Raise floor to next highest floor and change texture
 	case 19:				// Lower floor to highest surrounding floor
+	case 36:				// W1 Lower floor (turbo) to 8 above highest surrounding floor
 	case 38:				// Lower floor to lowest surrounding floor
 	case 5:  case 91:			// Raise floor to lowest surrounding ceiling
 	case 62: case 123:			// Plat Down-Wait-Up-Stay (SR/S1)
@@ -601,6 +609,12 @@ static void Doom_ApplySpecialToSector(doommap_t *dm, int si, int special, int ta
 				d->floor_target = Doom_FindHighestFloorSurrounding(dm, si);
 			}
 			break;
+		case 36: // Lower floor (TURBO) to 8 above highest surrounding floor (chocolate p_floor.c: turboLower)
+			if (d->state == 0) {
+				d->state = 3; d->move_floor = true; d->speed = DOOR_SPEED * 4;	//4x = FLOORSPEED*4
+				d->floor_target = Doom_FindHighestFloorSurrounding(dm, si) + 8;
+			}
+			break;
 		case 38: // Lower floor to lowest surrounding floor
 			if (d->state == 0) {
 				d->state = 3; d->move_floor = true; d->speed = DOOR_SPEED;
@@ -641,8 +655,23 @@ static void Doom_ApplySpecialToSector(doommap_t *dm, int si, int special, int ta
 
 		// --- EXITS ---
 		case 11: case 51: case 52: case 124:
-			Cbuf_AddText("echo LEVEL COMPLETE; nextmap\n", 0);
+		{	//advance to the next Doom map (plain `nextmap` has no target for a single +map load).
+			//ExMy -> ExM(y+1); mapNN -> map(NN+1). Secret exits (51/124) just go to the next map too.
+			char next[32]; const char *b = doom_mapbase;
+			if ((b[0]=='e'||b[0]=='E') && b[1]>='1'&&b[1]<='9' && (b[2]=='m'||b[2]=='M') && b[3]>='1'&&b[3]<='9')
+				Q_snprintfz(next, sizeof(next), "e%cm%d", b[1], atoi(b+3)+1);
+			else if (!Q_strncasecmp(b, "map", 3))
+				Q_snprintfz(next, sizeof(next), "map%02d", atoi(b+3)+1);
+			else
+				next[0] = 0;
+			//RESTRICT_LOCAL: `map`/`nextmap` are trusted server commands; at level 0 they are filtered
+			//out of the cbuf, which is why the exit reported "unknown command map".
+			if (next[0])
+				Cbuf_AddText(va("echo LEVEL COMPLETE; map %s\n", next), RESTRICT_LOCAL);
+			else
+				Cbuf_AddText("echo LEVEL COMPLETE; nextmap\n", RESTRICT_LOCAL);
 			break;
+		}
 	}
 }
 
@@ -661,6 +690,13 @@ void Doom_ActivateLinedef(model_t *model, int linedef_idx)
 
 	if (!Doom_IsActivatableLinedef(special))
 		return;
+
+	if (special == 11 || special == 51 || special == 52 || special == 124)
+	{	//exit switches/lines act on no sector - handle directly. (They're usually one-sided switch
+		//walls, so the tag==0 back-sector path below would bail on sidedef[1]==0xffff and never exit.)
+		Doom_ApplySpecialToSector(dm, 0, special, tag, linedef_idx);
+		return;
+	}
 
 	if (tag == 0)
 	{
@@ -711,6 +747,26 @@ static qboolean Doom_DoorBlocked(doommap_t *dm, int sector_idx, float newceil, c
 	return false;
 }
 
+//Keep the player standing ON the floor of the sector they're in: if their feet are below it (by
+//<=24) snap them up onto it. This finishes a step-up (Doom_Trace now lets them walk into a higher
+//sector at the old height) AND carries them up with a rising lift, instead of leaving them embedded
+//in the floor. Mirrors Doom P_TryMove (raise onto step) + P_ChangeSector (move riders up).
+void Doom_PlayerFloorSnap(model_t *model, float *origin, float *velocity)
+{
+	doommap_t *dm = model?model->meshinfo:NULL;
+	msector_t *sec; float feet, floor;
+	if (!dm) return;
+	sec = Doom_SectorNearPoint(dm, origin);
+	if (!sec) return;
+	floor = sec->floorheight;
+	feet = origin[2] - 24;	//player mins.z is -24, so feet sit 24 below the origin
+	if (feet < floor - 0.1f && (floor - feet) <= 24.5f && velocity[2] <= 8)
+	{	//embedded in / below the floor by a climbable amount, and not jumping: lift onto it
+		origin[2] = floor + 24;
+		if (velocity[2] < 0) velocity[2] = 0;
+	}
+}
+
 // Per-frame tick: animate all active door/platform/floor sectors
 void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 {
@@ -727,6 +783,22 @@ void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 		if (ld->types == 48) { // scroll left
 			dm->sidedef[ld->sidedef[0]].texx += 64 * frametime;
 		}
+	}
+
+	// flip used switches back to their SW1 art after the button time
+	for (i = 0; i < (unsigned)dm->numswitchback; )
+	{
+		struct doomswitchback_s *b = &dm->switchback[i];
+		b->timer -= frametime;
+		if (b->timer <= 0)
+		{
+			msidedef_t *s = &dm->sidedef[b->sidedef];
+			if      (b->which==0) s->uppertex  = b->origtex;
+			else if (b->which==1) s->middletex = b->origtex;
+			else                  s->lowertex  = b->origtex;
+			dm->switchback[i] = dm->switchback[--dm->numswitchback];	//swap-remove
+		}
+		else i++;
 	}
 
 	// Simple light effects
@@ -780,7 +852,13 @@ void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 		case 2:	// waiting
 			d->wait_time -= frametime;
 			if (d->wait_time <= 0)
-				d->state = 3; // start closing/lowering
+			{	//a lift at the bottom returns UP (raise to its original height); doors/floors lower.
+				//Without this the floor-lower path snapped the lift up instantly (target above current).
+				if (d->move_floor && d->floor_target > sec->floorheight)
+					d->state = 1; // lift rising back up
+				else
+					d->state = 3; // door closing / floor lowering
+			}
 			break;
 		case 3:	// lowering
 			if (d->move_floor) {
@@ -1098,20 +1176,31 @@ qboolean Doom_Trace(model_t *model, int hulloverride, const framestate_t *frames
 			return false;
 		}
 
-		//Check floor/ceiling collision
+		//Check floor/ceiling collision. A floor higher than the player's feet ahead is a STEP: for a
+		//roughly-horizontal move let them walk onto steps up to 24 units (Doom auto-climbs; the player
+		//frame's floor-snap then lifts them onto it) and only stop on taller walls. Vertical moves
+		//(landing) still stop precisely on the floor so the player doesn't sink through it.
 		if (current_feetz < fz - 0.1f) {
-			if (fabs(dir[2]) > 1e-6f) {
-				float hitz = fz - mins[2];
-				trace->fraction = (hitz - start[2]) / (end[2] - start[2]);
-			} else {
-				trace->fraction = (i == 1) ? 0 : (cur_dist - step) / dist;
+			qboolean horizontal = fabs(dir[2]) < 0.1f;
+			if (horizontal && (fz - current_feetz) <= 24.1f)
+			{
+				//climbable step: keep tracing (do not treat this higher floor as a blocking surface)
 			}
-			if (trace->fraction < 0) trace->fraction = 0;
-			if (trace->fraction > 1) trace->fraction = 1;
-			VectorMA(start, trace->fraction, move, trace->endpos);
-			VectorSet(trace->plane.normal, 0, 0, 1);
-			trace->plane.dist = fz;
-			return false;
+			else
+			{
+				if (fabs(dir[2]) > 1e-6f) {
+					float hitz = fz - mins[2];
+					trace->fraction = (hitz - start[2]) / (end[2] - start[2]);
+				} else {
+					trace->fraction = (i == 1) ? 0 : (cur_dist - step) / dist;
+				}
+				if (trace->fraction < 0) trace->fraction = 0;
+				if (trace->fraction > 1) trace->fraction = 1;
+				VectorMA(start, trace->fraction, move, trace->endpos);
+				VectorSet(trace->plane.normal, 0, 0, 1);
+				trace->plane.dist = fz;
+				return false;
+			}
 		}
 		if (current_feetz + height > cz + 0.1f) {
 			if (fabs(dir[2]) > 1e-6f) {
@@ -1672,6 +1761,27 @@ static void R_RecursiveDoomNode(doommap_t *dm, unsigned int node)
 
 static void R_DoomDrawMonsters(doommap_t *dm);	//defined with the monster code, below
 
+//how a decoration/pickup voxel/model orients, matching VoxelDoom's CheelloVoxHandler:
+//1 = spins about its axis (weapons, armour, bonuses, keys, radsuit, map, infrared),
+//2 = faces the camera/billboard (the round spheres + evil eye),
+//0 = static (medkit, stimpack, ammo, scenery: candelabra, columns, trees, ...).
+static int Doom_DecorSpinMode(unsigned short type)
+{
+	switch(type)
+	{
+	case 2013: case 83: case 2022: case 2024: case 41:	//soul, mega, invuln, blur sphere, evil eye
+		return 2;
+	case 2001: case 82: case 2002: case 2003: case 2004: case 2006: case 2005:	//weapons (+SSG, chainsaw)
+	case 2018: case 2019:	//green/blue armour
+	case 2014: case 2015:	//health/armour bonus
+	case 5: case 40: case 6: case 39: case 13: case 38:	//keys
+	case 2025: case 2026: case 2045:	//radsuit, computer map, light-amp visor
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 //draw item/decoration things as camera-facing vertical billboards using their Doom
 //sprites. Called after the opaque world so they depth-test against it; alpha-tested so
 //the transparent sprite background is masked with crisp edges.
@@ -1726,8 +1836,11 @@ static void R_DoomDrawSprites(doommap_t *dm)
 		struct doomsprite_s *s = &dm->sprites[i];
 		float zb = s->origin[2];	//rest the sprite's bottom on the floor (Doom items sit on the ground)
 		float zt = zb + s->h;
-		//collectable pickups (and monster drops) spin around their vertical axis (gzdoom voxel-item look)
-		float pspin = s->pickup ? (float)(realtime*spinrate) : 0;
+		//orientation per VoxelDoom: spin some pickups, face-camera the spheres, rest static
+		float vyaw = voxyaw, myaw = decoryaw;	//voxel / model base yaw
+		{ int sm = Doom_DecorSpinMode(s->type);
+		  if (sm == 1) { float sp=(float)(realtime*spinrate); vyaw+=sp; myaw+=sp; }
+		  else if (sm == 2) { float fy=(float)(atan2(r_refdef.vieworg[1]-s->origin[1], r_refdef.vieworg[0]-s->origin[0])*(180.0/M_PI)); vyaw=fy; myaw=fy; } }
 		vec3_t l, r;
 		if (usemod && s->voxname[0])
 		{	//MD2 model for this decoration/pickup, if a def exists. Try the full sprite+frame name
@@ -1737,11 +1850,11 @@ static void R_DoomDrawSprites(doommap_t *dm)
 			char pfx[5]; vec3_t mo;
 			pfx[0]=s->voxname[0]; pfx[1]=s->voxname[1]; pfx[2]=s->voxname[2]; pfx[3]=s->voxname[3]; pfx[4]=0;
 			VectorCopy(s->origin, mo); mo[2]+=modz;
-			if (Doom_DrawModel(s->voxname, DMDL_WALK, spin, 0, mo, decoryaw+pspin, modscale) ||
-			    Doom_DrawModel(pfx,        DMDL_WALK, spin, 0, mo, decoryaw+pspin, modscale))
+			if (Doom_DrawModel(s->voxname, DMDL_WALK, spin, 0, mo, myaw, modscale) ||
+			    Doom_DrawModel(pfx,        DMDL_WALK, spin, 0, mo, myaw, modscale))
 				continue;
 		}
-		if (usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, voxyaw+pspin, voxscale))
+		if (usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, vyaw, voxscale))
 			continue;	//rendered as a voxel; otherwise fall back to the sprite billboard
 		if (!s->shader)
 			continue;
@@ -1805,6 +1918,8 @@ void R_DoomWorld(void)
 		if (texnum == dm->skytex)
 			continue;	//sky already drawn (as a depth-masked backdrop) above
 		t = &dm->textures[texnum];
+		if (t->nanimframes > 1)	//animated liquid flat: pick the current frame (8 tics = 8/35s each)
+			t->shader = t->animframes[((int)(realtime/(8.0/35.0))) % t->nanimframes];
 		if (t->mesh.numindexes && t->shader)
 		{
 			t->batch.next = mod->batches[t->shader->sort];
@@ -2361,6 +2476,59 @@ static int Doom_LoadPatch(doommap_t *dm, char *name)
 	return texnum;
 }
 
+//Doom switch textures come in SW1xxxx/SW2xxxx pairs; using a switch flips between them. Returns the
+//paired name (SW1<->SW2) for `name`, or NULL if it isn't a switch texture.
+static const char *Doom_SwitchPair(const char *name, char out[8])
+{
+	if ((name[0]!='S'&&name[0]!='s') || (name[1]!='W'&&name[1]!='w') || (name[2]!='1'&&name[2]!='2'))
+		return NULL;
+	memcpy(out, name, 8);
+	out[2] = (name[2]=='1') ? '2' : '1';
+	return out;
+}
+//At map load (before Doom_LoadShaders builds the shaders) make sure BOTH halves of every switch
+//pair the map uses are in dm->textures, so a runtime swap just changes a sidedef's texture index to
+//an already-shaded texture (no realloc / missing-shader at runtime).
+void Doom_PreloadSwitchTextures(doommap_t *dm)
+{
+	int i, n = (int)dm->numtextures; char pair[8];
+	for (i = 0; i < n; i++)
+		if (Doom_SwitchPair(dm->textures[i].name, pair))
+			Doom_LoadPatch(dm, pair);	//loads the partner if absent (adds before shaders are built)
+}
+//Use of a switch line: flip its SW1<->SW2 texture, play the click, and schedule the flip-back.
+void Doom_SwitchUse(model_t *model, int linedef_idx)
+{
+	doommap_t *dm = model?model->meshinfo:NULL;
+	dlinedef_t *ld; msidedef_t *sd; int *fields[3]; qbyte which[3]; int k; char pair[8]; vec3_t org;
+	if (!dm || linedef_idx < 0 || (unsigned)linedef_idx >= dm->numlinedefs) return;
+	ld = &dm->linedef[linedef_idx];
+	if (ld->sidedef[0] == 0xffff) return;
+	sd = &dm->sidedef[ld->sidedef[0]];	//switch art is on the front side
+	fields[0]=&sd->uppertex; which[0]=0; fields[1]=&sd->middletex; which[1]=1; fields[2]=&sd->lowertex; which[2]=2;
+	for (k = 0; k < 3; k++)
+	{
+		int t = *fields[k];
+		if (t < 0 || t >= (int)dm->numtextures) continue;
+		if (!Doom_SwitchPair(dm->textures[t].name, pair)) continue;	//not a switch texture
+		*fields[k] = Doom_LoadPatch(dm, pair);				//flip to the partner (preloaded)
+		//schedule the flip-back (~1s, Doom BUTTONTIME) unless full
+		if (dm->numswitchback < 32)
+		{
+			dm->switchback[dm->numswitchback].sidedef = ld->sidedef[0];
+			dm->switchback[dm->numswitchback].which   = which[k];
+			dm->switchback[dm->numswitchback].origtex = t;
+			dm->switchback[dm->numswitchback].timer   = 1.0f;
+			dm->numswitchback++;
+		}
+		org[0]=(dm->vertexes[ld->vert[0]].xpos+dm->vertexes[ld->vert[1]].xpos)*0.5f;
+		org[1]=(dm->vertexes[ld->vert[0]].ypos+dm->vertexes[ld->vert[1]].ypos)*0.5f;
+		org[2]=0;
+		Doom_PlaySound(org, "DSSWTCHN");
+		break;	//one switch face per line
+	}
+}
+
 //load a single Doom sprite picture (sprites/<name>) into an RGBA texture, returning
 //its pixel size and left/top offsets (the hotspot used to place the billboard).
 static texid_t Doom_LoadSprite(const char *name, short *w, short *h, short *xo, short *yo)
@@ -2687,6 +2855,19 @@ static shader_t *Doom_MonsterSpriteShader(const char *lump, short *w, short *h, 
 #define DKEY_BSKULL    4096
 #define DKEY_YSKULL    8192
 #define DKEY_RSKULL    16384
+
+//locked-door specials -> the key bits that open them (card OR skull of that colour, as in vanilla).
+//26/32 = blue, 27/34 = yellow, 28/33 = red. 0 = no key needed.
+int Doom_DoorKeyMask(int special)
+{
+	switch(special)
+	{
+	case 26: case 32: case 99:  case 133: return DKEY_BCARD | DKEY_BSKULL;	//blue
+	case 27: case 34: case 136: case 137: return DKEY_YCARD | DKEY_YSKULL;	//yellow
+	case 28: case 33: case 134: case 135: return DKEY_RCARD | DKEY_RSKULL;	//red
+	default: return 0;
+	}
+}
 
 //=============================== Doom status-bar HUD (2D) =================================
 // Faithful bottom status bar (STBAR) + first-person weapon, drawn in screen space via R2D_Image
@@ -3134,10 +3315,16 @@ static qboolean Doom_SightLine(doommap_t *dm, const vec3_t a, const vec3_t b)
 void Doom_PlaySound(const vec3_t org, const char *lump)
 {
 	extern void SV_StartSound(int ent, vec3_t origin, float *velocity, int seenmask, int channel, const char *sample, int volume, float attenuation, float pitchadj, float timeofs, unsigned int flags);
-	char nm[24];
+	char nm[24]; char *p;
 	if (!lump || !*lump) return;
 	Q_snprintfz(nm, sizeof(nm), "wad/%s", lump);
-	SV_StartSound(0, (float*)org, vec3_origin, 0, CHAN_AUTO, nm, 255, 1.0f, 1.0f, 0, 0);
+	//lowercase: the precache list (SV_DoomPrecacheSounds via the FS, which lowercases lumps) holds
+	//lower-case names, and SV_StartSound's index lookup is case-SENSITIVE - a "wad/DSPISTOL" request
+	//would miss the precached "wad/dspistol" and play nothing.
+	for (p = nm; *p; p++) if (*p>='A' && *p<='Z') *p += 32;
+	//seenmask = ~0 (FULLDIMENSIONMASK), NOT 0: SV_Multicast skips every client whose dimension_see
+	//doesn't intersect the mask, so the old 0 mask dropped the sound to NO clients - the "no sound" bug.
+	SV_StartSound(0, (float*)org, vec3_origin, ~0, CHAN_AUTO, nm, 255, 1.0f, 1.0f, 0, 0);
 }
 //per-monster sound lump for an event: 0=sight 1=pain 2=death 3=attack (NULL = silent). Some are
 //full-Doom-only (caco/baron/...) and just won't play under the shareware WAD.
@@ -3422,6 +3609,7 @@ static void Doom_BarrelExplode(doommap_t *dm, struct doommonster_s *barrel, cons
 {
 	Doom_PlaySound(barrel->origin, "DSBAREXP");
 	Doom_RadiusDamage(dm, barrel->origin, 128, 128, playerorg, ph, pa);
+	//no particle burst: the barrel's explosion is the animated sprite/model (BEXP frames / barrelx1.md2)
 }
 
 //Would moving this monster's body (a circle of radius m->radius) to (nx,ny) jam it against a
@@ -3743,9 +3931,13 @@ void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, 
 				}
 				continue;
 			}
-			//detonate a freshly-killed barrel, then advance the death animation timer (no AI)
+			//detonate a freshly-killed barrel ONCE, then advance the death animation timer (no AI).
+			//exploded must latch true or the blast (and its particle burst) re-fires every tick.
 			if ((m->atk & MATK_BARREL) && !m->exploded)
+			{
+				m->exploded = 1;
 				Doom_BarrelExplode(dm, m, playerorg, playerhealth, playerarmor);
+			}
 			if (!m->dropped)
 			{	//former humans drop their weapon/ammo on death (Doom P_KillMobj)
 				unsigned short drop=0;
@@ -3854,7 +4046,7 @@ void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, 
 						Doom_HurtPlayer(playerhealth, playerarmor, m->meleedmg * Doom_Rand(1, m->meleerand));
 				} else if (a == MATK_HITSCAN) {
 					int b; for (b=0;b<m->bullets;b++)
-						if (Doom_HitscanHits(dist))
+						if (dist <= 2048 && Doom_HitscanHits(dist))	//Doom MISSILERANGE cap + per-bullet spread vs the player's subtended angle
 							Doom_HurtPlayer(playerhealth, playerarmor, m->misdmg * Doom_Rand(1,5));
 				} else if (a == MATK_MISSILE) {
 					Doom_SpawnProjectile(dm, m->origin, playerorg, m->misdmg, m->misspeed, !!(m->atk & MATK_HOMING));
@@ -4044,31 +4236,37 @@ void Doom_PlayerAttack(model_t *model, const vec3_t org, float yaw, int pellets,
 	int p; vec3_t a;
 	if (!dm)
 		return;
+	float range = (maxrange > 0) ? maxrange : 2048;	//Doom MISSILERANGE = 32*64
 	VectorSet(a, org[0], org[1], org[2]+16);	//player body ~feet+40 (origin is feet+24)
 	for (p = 0; p < pellets; p++)
 	{
-		unsigned int i, best=~0u; float bestdist, fwdx, fwdy, pyaw;
-		bestdist = (maxrange > 0) ? maxrange : 2000;
-		//apply horizontal spread for multi-pellet weapons (shotguns)
-		pyaw = yaw + (pellets > 1 ? (float)(Doom_Rand(0, 1000)-500)*0.02f : 0);
+		unsigned int i, best=~0u; float bestt=range, fwdx, fwdy, pyaw, sp;
+		//Doom hitscan: a ray along the aim yaw, NOT a wide auto-aim cone. You hit the first monster
+		//whose body cylinder the ray actually crosses (chocolate p_map.c P_LineAttack). Spread is
+		//P_GunShot's P_SubRandom()<<18 (~+-5.6 deg) per shotgun pellet; single-shot weapons get a
+		//small spread so they're not pixel-perfect sniper rifles.
+		sp = (pellets > 1) ? ((Doom_Rand(0,255)-Doom_Rand(0,255))*(5.6f/255.0f))
+		                   : ((Doom_Rand(0,255)-Doom_Rand(0,255))*(2.2f/255.0f));
+		pyaw = yaw + sp;
 		fwdx = cos(pyaw*M_PI/180.0); fwdy = sin(pyaw*M_PI/180.0);
 		for (i = 0; i < dm->nummonsters; i++)
 		{
 			struct doommonster_s *m = &dm->monsters[i];
-			float dx,dy,dist,dot; vec3_t b;
+			float dx,dy,t,perp2,rad; vec3_t b;
 			if (m->mstate == 2)
 				continue;
 			dx=m->origin[0]-org[0]; dy=m->origin[1]-org[1];
-			dist=sqrt(dx*dx+dy*dy);
-			if (dist < 1 || dist > bestdist)
-				continue;
-			dot=(dx*fwdx+dy*fwdy)/dist;
-			if (dot < 0.96f)	//~16 deg auto-aim cone
-				continue;
+			t = dx*fwdx + dy*fwdy;			//distance of the monster along the ray
+			if (t < 1 || t > bestt)
+				continue;			//behind the player, or beyond range / a nearer hit
+			perp2 = (dx*dx+dy*dy) - t*t;		//squared perpendicular distance from the ray
+			rad = (float)m->radius;
+			if (perp2 > rad*rad)
+				continue;			//ray passes outside the body cylinder: a miss
 			VectorSet(b, m->origin[0], m->origin[1], m->origin[2]+40);
 			if (!Doom_SightLine(dm, a, b))
-				continue;
-			best=i; bestdist=dist;
+				continue;			//wall in the way
+			best=i; bestt=t;			//closest monster the ray crosses
 		}
 		if (best != ~0u)
 		{
@@ -4526,7 +4724,10 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			if (m->atk & MATK_BARREL) mcount = -1;
 			//overkill: play the gib model (xdeath) if this monster has one, clamp-hold to the gib pile.
 			//(sprite path keeps the death frames - no gib sprites are loaded - so this is the MD2 win.)
-			if (m->gibbed) { mph=DMDL_GIB; mcount=-1; }
+			//Use the UNCAPPED deathtime index: df above is clamped to the 5-frame death-sprite count,
+			//but the gib model has ~9 frames and only its last one settles on the floor - clamping to
+			//df left it frozen mid-explosion (chunks hanging in the air).
+			if (m->gibbed) { mph=DMDL_GIB; mcount=-1; midx=(int)(m->deathtime/0.15f); }
 			sh = m->deathfr[df]; sw = m->dfw[df]; shh = m->dfh[df]; sxo = m->dfxo[df]; syo = 0;
 			{ const char *ds=(m->atk&MATK_BARREL)?"ABCDE":Doom_DeathSeq(m->spr);
 			  if(m->atk&MATK_BARREL)vbase="BEXP"; if(ds&&df<(int)strlen(ds))vlet=ds[df]; }
@@ -4613,6 +4814,50 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 	}
 }
 
+//Doom animated flats (chocolate p_spec.c animdefs, istexture=false). A flat whose name falls in
+//one of these groups cycles through the whole group at 8 tics/frame (~0.23s). Returns the frame
+//count and fills frames[] with the lump names (e.g. NUKAGE1/2/3); 0 if not animated.
+static int Doom_FlatAnim(const char *flat, char frames[12][16])
+{
+	static const struct { const char *start, *end; } tab[] = {
+		{"NUKAGE1","NUKAGE3"},{"FWATER1","FWATER4"},{"SWATER1","SWATER4"},{"LAVA1","LAVA4"},
+		{"BLOOD1","BLOOD3"},{"RROCK05","RROCK08"},{"SLIME01","SLIME04"},{"SLIME05","SLIME08"},
+		{"SLIME09","SLIME12"},
+	};
+	unsigned g;
+	for (g = 0; g < sizeof(tab)/sizeof(tab[0]); g++)
+	{
+		const char *s = tab[g].start, *e = tab[g].end;
+		int plen=0, first, last, width, num, n, k;
+		while (s[plen] && (s[plen]<'0' || s[plen]>'9')) plen++;	//prefix length (non-digits)
+		first = atoi(s+plen); last = atoi(e+plen); width = (int)strlen(s)-plen;
+		if (Q_strncasecmp(flat, s, plen)) continue;		//different prefix
+		if ((int)strlen(flat) != (int)strlen(s)) continue;	//different digit width
+		num = atoi(flat+plen);
+		if (num < first || num > last) continue;		//not in this group's range
+		for (n=0, k=first; k<=last && n<12; k++, n++)
+			Q_snprintfz(frames[n], 16, "%.*s%0*d", plen, s, width, k);
+		return n;
+	}
+	return 0;
+}
+//build a standalone shader for one flat lump (its own 64x64 texture), for animation frames
+static shader_t *Doom_BuildFlatShader(const char *lump)
+{
+	char path[64], name[64]; texnums_t tn; void *file; shader_t *sh;
+	memset(&tn, 0, sizeof(tn));
+	Q_snprintfz(name, sizeof(name), "flats/%s", lump);		//texture NAME has no extension...
+	Q_snprintfz(path, sizeof(path), "flats/%s.raw", lump);		//...but the raw 64x64 data is loaded from .raw
+	file = FS_LoadMallocFile(path, NULL);
+	if (!file) return NULL;
+	tn.base = Image_GetTexture(name, NULL, 0, file, doompalette, 64, 64, TF_8PAL24);	//name w/o .raw: else "format unsupported"
+	Z_Free(file);
+	if (!TEXVALID(tn.base)) return NULL;
+	sh = R_RegisterShader(va("doom_flatanim/%s", lump), SUF_NONE, "{\n{\nmap $diffuse\nrgbgen vertex\nalphagen vertex\n}\n}\n");
+	R_BuildDefaultTexnums(&tn, sh, 0);
+	return sh;
+}
+
 static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 {
 	model_t *mod = ctx;
@@ -4623,6 +4868,22 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 	int texnum;
 	char tmp[MAX_QPATH];
 	char skyname[16] = "sky1", shadername[32], shaderbody[256];
+
+	{	//remember the map basename (skip any "pwad#" prefix) so the exit switch can pick the next map
+		char mb[MAX_QPATH]; const char *m;
+		COM_FileBase(mod->name, mb, sizeof(mb));
+		m = strchr(mb, '#'); m = m ? m+1 : mb;
+		Q_strncpyz(doom_mapbase, m, sizeof(doom_mapbase));
+	}
+
+	//hi-res textures: enabling doom_hires turns on FTE's external-texture replacement (gl_load24bit),
+	//so each wall/flat/sprite will use an external image named after it (e.g. flats/NUKAGE1.png,
+	//<wallname>.png, sprites/POSSA1.png) when one is present, falling back to the WAD art otherwise.
+	if ((int)Cvar_Get("doom_hires", "0", CVAR_ARCHIVE, "Doom")->value)
+	{
+		cvar_t *l24 = Cvar_FindVar("gl_load24bit");
+		if (l24 && !l24->ival) Cvar_SetValue(l24, 1);
+	}
 
 	if (dm->skytex >= 0)
 	{
@@ -4712,6 +4973,22 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 			dm->textures[texnum].shader = R_RegisterShader(dm->textures[texnum].name, SUF_NONE, "{\n{\nmap $diffuse\nrgbgen vertex\nalphagen vertex\n}\n}\n");
 
 		R_BuildDefaultTexnums(&tn, dm->textures[texnum].shader, 0);
+
+		dm->textures[texnum].nanimframes = 0;
+		if (isflat)
+		{	//animated liquid flat (nukage/lava/water/...): preload every frame of its group
+			char frames[12][16]; int nf = Doom_FlatAnim(dm->textures[texnum].name+6, frames);	//+6 skips "flats/"
+			if (nf > 1)
+			{
+				int k;
+				for (k = 0; k < nf; k++)
+				{
+					shader_t *fs = Doom_BuildFlatShader(frames[k]);
+					dm->textures[texnum].animframes[k] = fs ? fs : dm->textures[texnum].shader;
+				}
+				dm->textures[texnum].nanimframes = (qbyte)nf;
+			}
+		}
 	}
 
 	//item/decoration billboards: resolve sprites now that textures+geometry are ready
@@ -5551,6 +5828,7 @@ qboolean QDECL Mod_LoadDoomLevel(model_t *mod, void *buffer, size_t fsize)
 	mod->numclusters = dm->numsectors;
 
 	CleanWalls(dm, sidedefsl);
+	Doom_PreloadSwitchTextures(dm);	//load both halves of each SW1/SW2 pair before shaders are built
 
 	Doom_CalcSubsectorSectors(dm);
 
