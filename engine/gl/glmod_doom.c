@@ -1050,6 +1050,7 @@ static float Doom_ThingSolidRadius(unsigned short type)
 	case 43:		//TRE1 burnt tree
 	case 47:		//SMIT stalagmite
 	case 35:		//CBRA candelabra
+	case 85: case 86:	//TLMP/TLP2 techno floor lamps (solid in vanilla)
 		return 16;
 	default: return 0;
 	}
@@ -1273,7 +1274,12 @@ qboolean Doom_Trace(model_t *model, int hulloverride, const framestate_t *frames
 		}
 	}
 
-	//Monster clip
+	//Monster/barrel clip: swept CIRCLE (cylinder) vs the move, not an AABB. The old axis-aligned
+	//slab test approximated each thing as a SQUARE, whose corners gave a contact normal that didn't
+	//point at the thing's centre - so running into a barrel produced a near -dir normal that
+	//PM_ClipVelocity zeroed, gluing the player on. A true circle gives a radial contact normal (the
+	//player slides around), and when already overlapping we only block motion that digs deeper in
+	//(so the player can always back/slide out instead of sticking).
 	{
 		float pr = radius - 0.1f; //lenient radius for sliding
 		vec3_t fulld;
@@ -1282,38 +1288,38 @@ qboolean Doom_Trace(model_t *model, int hulloverride, const framestate_t *frames
 		for (mi2 = 0; mi2 < dm->nummonsters; mi2++)
 		{
 			struct doommonster_s *m = &dm->monsters[mi2];
-			float R, tmin, tmax, plo, phi, mlo, mhi;
-			qboolean miss = false;
-			int ax;
+			float R, ex, ey, fx, fy, a, b, cc, t, plo, phi, mlo, mhi;
 			if (m->mstate == 2) continue;
 			plo = start[2] + mins[2]; phi = start[2] + maxs[2];
 			mlo = m->origin[2]; mhi = m->origin[2] + (m->h[0][0] ? m->h[0][0] : 56);
-			if (phi <= mlo || plo >= mhi) continue;
-			R = m->radius + pr;
-			tmin = 0; tmax = 1;
-			for (ax = 0; ax < 2; ax++) {
-				float c = m->origin[ax], d = fulld[ax], s = start[ax], t1, t2;
-				if (fabs(d) < 1e-6f) { if (s < c - R || s > c + R) { miss = true; break; } }
-				else {
-					t1 = (c - R - s) / d; t2 = (c + R - s) / d;
-					if (t1 > t2) { float tt = t1; t1 = t2; t2 = tt; }
-					if (t1 > tmin) tmin = t1;
-					if (t2 < tmax) tmax = t2;
-					if (tmin > tmax) { miss = true; break; }
-				}
+			if (phi <= mlo || plo >= mhi) continue;		//no vertical overlap: can't collide
+			R  = m->radius + pr;
+			ex = start[0]-m->origin[0]; ey = start[1]-m->origin[1];	//player relative to thing centre
+			fx = fulld[0]; fy = fulld[1];
+			a  = fx*fx + fy*fy;
+			if (a < 1e-9f) continue;					//no horizontal movement
+			cc = ex*ex + ey*ey - R*R;
+			if (cc < 0)
+			{	//already inside the thing's radius
+				if (ex*fx + ey*fy >= 0) continue;		//moving outward/tangent: let the player leave
+				t = 0;									//moving inward: stop here, normal pushes back out
 			}
-			if (miss || tmin < 0 || tmin >= trace->fraction) continue;
-			
-			//If tmin is 0, we are already overlapping - but only if the step isn't small.
-			//Doom's discrete logic can handle a tiny amount of overlap.
-			if (tmin < 0.001f && VectorLength(fulld) < 0.1f) continue;
-
-			trace->fraction = tmin;
-			VectorMA(start, tmin, fulld, trace->endpos);
-			float nx = trace->endpos[0]-m->origin[0], ny = trace->endpos[1]-m->origin[1], nl = sqrt(nx*nx+ny*ny);
-			if (nl < 1e-6f) { nx = -fulld[0]; ny = -fulld[1]; nl = sqrt(nx*nx+ny*ny); if (nl<1e-6f){nx=1;ny=0;nl=1;} }
-			trace->plane.normal[0] = nx/nl; trace->plane.normal[1] = ny/nl; trace->plane.normal[2] = 0;
-			trace->plane.dist = DotProduct(trace->plane.normal, trace->endpos);
+			else
+			{	//approaching from outside: first crossing of the circle
+				b = 2.0f*(ex*fx + ey*fy);
+				float disc = b*b - 4.0f*a*cc;
+				if (disc <= 0) continue;				//ray misses the circle
+				t = (-b - sqrt(disc)) / (2.0f*a);
+				if (t < 0 || t >= trace->fraction) continue;
+			}
+			trace->fraction = t;
+			VectorMA(start, t, fulld, trace->endpos);
+			{
+				float nx = trace->endpos[0]-m->origin[0], ny = trace->endpos[1]-m->origin[1], nl = sqrt(nx*nx+ny*ny);
+				if (nl < 1e-6f) { nx = -fx; ny = -fy; nl = sqrt(nx*nx+ny*ny); if (nl<1e-6f){nx=1;ny=0;nl=1;} }
+				trace->plane.normal[0] = nx/nl; trace->plane.normal[1] = ny/nl; trace->plane.normal[2] = 0;
+				trace->plane.dist = DotProduct(trace->plane.normal, trace->endpos);
+			}
 		}
 	}
 
@@ -1891,11 +1897,13 @@ static void R_DoomDrawSprites(doommap_t *dm)
 		struct doomsprite_s *s = &dm->sprites[i];
 		float zb = s->origin[2];	//rest the sprite's bottom on the floor (Doom items sit on the ground)
 		float zt = zb + s->h;
-		//orientation per VoxelDoom: spin some pickups, face-camera the spheres, rest static
+		//orientation per VoxelDoom: spheres face the camera; every collectable item spins around its
+		//vertical axis (s->pickup covers ammo/health/etc., not just the few in Doom_DecorSpinMode);
+		//fixed scenery (lamps, columns, trees, gore) stays static.
 		float vyaw = voxyaw, myaw = decoryaw;	//voxel / model base yaw
 		{ int sm = Doom_DecorSpinMode(s->type);
-		  if (sm == 1) { float sp=(float)(realtime*spinrate); vyaw+=sp; myaw+=sp; }
-		  else if (sm == 2) { float fy=(float)(atan2(r_refdef.vieworg[1]-s->origin[1], r_refdef.vieworg[0]-s->origin[0])*(180.0/M_PI)); vyaw=fy; myaw=fy; } }
+		  if (sm == 2) { float fy=(float)(atan2(r_refdef.vieworg[1]-s->origin[1], r_refdef.vieworg[0]-s->origin[0])*(180.0/M_PI)); vyaw=fy; myaw=fy; }
+		  else if (sm == 1 || s->pickup) { float sp=(float)(realtime*spinrate); vyaw+=sp; myaw+=sp; } }
 		vec3_t l, r;
 		if (usemod && s->voxname[0])
 		{	//MD2 model for this decoration/pickup, if a def exists. Try the full sprite+frame name
@@ -1922,6 +1930,10 @@ static void R_DoomDrawSprites(doommap_t *dm)
 		BE_DrawMesh_Single(s->shader, &m, NULL, 0);
 	}
 }
+
+void Doom_DrawViewModel(void);			//first-person weapon viewmodel (defined below)
+qboolean Doom_ViewModelActive(int wi);	//is a 3D viewmodel drawn for this weapon? (2D HUD stands down)
+void Doom_LoadViewWeapon(int wi);		//preload a weapon's view/flash MD2 (main thread)
 
 void R_DoomWorld(void)
 {
@@ -1986,6 +1998,7 @@ void R_DoomWorld(void)
 
 	R_DoomDrawSprites(dm);	//item/decoration billboards, over the opaque world
 	R_DoomDrawMonsters(dm);	//monsters (billboards), over the opaque world
+	Doom_DrawViewModel();	//first-person weapon, attached to the camera (drawn on top, no depth)
 	Doom_EmitFX(dm);	//spawn queued blood/gib/explosion particles (drained once per frame)
 	//the HUD (status bar + first-person weapon) is drawn later in the 2D screen pass,
 	//via Doom_DrawHUD2D() called from SCR_DrawTwoDimensional (screen space, where R2D_* works).
@@ -2656,6 +2669,13 @@ static const char *Doom_ThingSprite(unsigned short type)
 	case 43:   return "TRE1A0";	//burnt tree
 	case 54:   return "TRE2A0";	//large brown tree
 	case 47:   return "SMITA0";	//stalagmite
+	case 44:   return "TBLUA0";	//tall blue torch
+	case 45:   return "TGRNA0";	//tall green torch
+	case 46:   return "TREDA0";	//tall red torch
+	case 85:   return "TLMPA0";	//tall techno floor lamp
+	case 86:   return "TLP2A0";	//short techno floor lamp
+	case 41:   return "CEYEA0";	//evil eye
+	case 42:   return "FSKUA0";	//floating skull-rock
 	//gore on the floor
 	case 24:   return "POL5A0";	//pool of blood and flesh
 	case 79:   return "POB1A0";	//pool of blood (Doom 2)
@@ -3004,6 +3024,7 @@ void Doom_DrawHUD2D(void)
 	// a vertical offset in virtual pixels (0 = rested, DW_DOWN = fully hidden below the screen).
 	wi=st[STAT_ACTIVEWEAPON]; fi=st[STAT_WEAPONFRAME];
 	if (wi<0||wi>=9) wi=2;
+	if (!Doom_ViewModelActive(wi))	//3D viewmodel handles this weapon -> skip the 2D HUD sprite
 	{
 		#define DW_DOWN  140.0f		//virtual px to drop the weapon fully out of sight
 		#define DW_SPEED 560.0f		//raise/lower speed in virtual px/sec (~0.25s each way)
@@ -3441,6 +3462,71 @@ void Doom_PlaySound(const vec3_t org, const char *lump)
 	//seenmask = ~0 (FULLDIMENSIONMASK), NOT 0: SV_Multicast skips every client whose dimension_see
 	//doesn't intersect the mask, so the old 0 mask dropped the sound to NO clients - the "no sound" bug.
 	SV_StartSound(0, (float*)org, vec3_origin, ~0, CHAN_AUTO, nm, 255, 1.0f, 1.0f, 0, 0);
+}
+//play a precached sound by its EXACT precache name (no "wad/" prefix), used for footsteps which live
+//in footsteps.pk3 at sound/footstep/<cat>/<name>.wav (referenced without the "sound/" prefix). On a
+//fixed channel so a new step cuts the previous one rather than letting them pile up.
+void Doom_PlaySoundName(const vec3_t org, const char *name)
+{
+	extern void SV_StartSound(int ent, vec3_t origin, float *velocity, int seenmask, int channel, const char *sample, int volume, float attenuation, float pitchadj, float timeofs, unsigned int flags);
+	if (!name || !*name) return;
+	SV_StartSound(0, (float*)org, vec3_origin, ~0, CHAN_BODY, name, 96, 1.0f, 1.0f, 0, 0);
+}
+
+//------------------------- footsteps -------------------------
+//Sounds ship in footsteps.pk3 as sound/footstep/<cat>/<cat><n>.wav; we reference them as
+//"footstep/<cat>/<cat><n>.wav" (S_LoadSound prepends "sound/"). Vanilla Doom has no terrain table,
+//so the surface category is approximated from the floor flat name by substring (see Doom_FootCat).
+static const struct { const char *cat; int count; } doomfootcat[] = {
+	{"default",4}, {"metal",6}, {"tile",6}, {"hard",6}, {"dirt",6},
+	{"gravel",4},  {"rock",8},  {"wood",4}, {"water",4},{"slime",4}, {"lava",4},
+};
+static int Doom_FootCat(const char *flat)	//flat = bare upper-case flat name (no "flats/")
+{
+	if (strstr(flat,"NUKAGE")||strstr(flat,"SLIME")||strstr(flat,"BLOOD"))	return 9;	//slime
+	if (strstr(flat,"LAVA"))						return 10;	//lava
+	if (strstr(flat,"WATER")||strstr(flat,"FWATER"))			return 8;	//water
+	if (strstr(flat,"WOOD"))						return 7;	//wood
+	if (strstr(flat,"ROCK")||strstr(flat,"GRNROCK")||strstr(flat,"GRASS"))	return 6;	//rock/outdoor
+	if (strstr(flat,"DIRT")||strstr(flat,"MUD"))				return 4;	//dirt
+	if (strstr(flat,"GRAV"))						return 5;	//gravel
+	if (strstr(flat,"TLITE")||strstr(flat,"TILE")||strstr(flat,"MARB")||strstr(flat,"FLAT1"))	return 2;	//tile
+	if (strstr(flat,"METAL")||strstr(flat,"FLAT5")||strstr(flat,"FLAT2")||strstr(flat,"STEP")||
+	    strstr(flat,"COMP")||strstr(flat,"CONS")||strstr(flat,"GATE")||strstr(flat,"FLOOR7"))	return 1;	//metal
+	if (strstr(flat,"FLOOR")||strstr(flat,"CEIL")||strstr(flat,"STONE")||strstr(flat,"BROWN"))	return 3;	//hard
+	return 0;	//default
+}
+//Iterate every footstep sample name (for SV_DoomPrecacheSounds); returns NULL past the end.
+const char *Doom_FootstepPrecacheName(int i)
+{
+	static char nm[48]; int c;
+	for (c = 0; c < (int)countof(doomfootcat); c++)
+	{
+		if (i < doomfootcat[c].count)
+		{
+			Q_snprintfz(nm, sizeof(nm), "footstep/%s/%s%d.wav", doomfootcat[c].cat, doomfootcat[c].cat, i+1);
+			return nm;
+		}
+		i -= doomfootcat[c].count;
+	}
+	return NULL;
+}
+//Pick a random footstep sample for the surface under 'org', or NULL when footsteps are off.
+const char *Doom_FootstepSound(model_t *model, const vec3_t org)
+{
+	doommap_t *dm = model?model->meshinfo:NULL;
+	msector_t *sec; const char *flat; int cat, n;
+	static char nm[48];
+	if (!dm) return NULL;
+	if (Cvar_Get("doom_footsteps","1",CVAR_ARCHIVE,"Doom")->value == 0) return NULL;
+	sec = Doom_SectorNearPoint(dm, org);
+	if (!sec || sec->floortex < 0 || (unsigned)sec->floortex >= dm->numtextures) return NULL;
+	flat = dm->textures[sec->floortex].name;	//"flats/NUKAGE1"
+	if (!strncmp(flat,"flats/",6)) flat += 6;
+	cat = Doom_FootCat(flat);
+	n = Doom_Rand(1, doomfootcat[cat].count);
+	Q_snprintfz(nm, sizeof(nm), "footstep/%s/%s%d.wav", doomfootcat[cat].cat, doomfootcat[cat].cat, n);
+	return nm;
 }
 //per-monster sound lump for an event: 0=sight 1=pain 2=death 3=attack (NULL = silent). Some are
 //full-Doom-only (caco/baron/...) and just won't play under the shareware WAD.
@@ -4735,6 +4821,127 @@ void Doom_PreloadModels(void)
 		for (slot=0;slot<3;slot++)
 			if (doommodels[i].mdl[slot][0])
 				Doom_ModelSlot(&doommodels[i], slot, &m, &s);
+	if ((int)Cvar_Get("doom_viewmodel", "1", CVAR_ARCHIVE, "Doom")->value)
+		for (i=0;i<9;i++)
+			Doom_LoadViewWeapon(i);	//first-person weapon models, loaded up front (main thread)
+}
+
+//================= first-person weapon view models (xmodels.pk3) =================
+// models/weapons/<dir>/view.md2 (+ optional flash.md2) drawn attached to the camera, replacing the
+// 2D HUD weapon sprite when doom_viewmodel is set. Indexed by STAT_ACTIVEWEAPON (0-8), the same
+// order as the HUD's wnames[]: PUN SAW PIS SHT SHT2 CHG MIS PLS BFG.
+static const char *doomvmdir[9] =
+	{ "fists","chainsaw","pistol","shotgun","sshotgun","chaingun","launcher","plasma","bfg" };
+static struct doomvm_s { qboolean tried; model_t *view, *flash; shader_t *vsh, *fsh; } doomvm[9];
+static float doomvm_off;	//shared raise/lower fraction (0=up .. 1=hidden)
+
+static shader_t *Doom_VMSkinShader(model_t *mod, const char *prefix)
+{	//shader for an MD2's embedded skin (opaque, double-sided, fullbright vertex colour). The
+	//on-top / additive behaviour is applied per-draw via BEF_ flags, so it's not baked in here.
+	galiasinfo_t *inf = mod?Mod_Extradata(mod):NULL;
+	const char *skin = (inf && inf->numskins>0 && inf->ofsskins && inf->ofsskins[0].numframes>0 && inf->ofsskins[0].frame)
+	                 ? inf->ofsskins[0].frame[0].shadername : NULL;
+	char body[320], shname[96];
+	if (!skin || !skin[0]) return NULL;
+	Q_snprintfz(shname,sizeof(shname),"%s/%s",prefix,skin);
+	Q_snprintfz(body,sizeof(body),"{\ncull none\n{\nmap \"%s\"\nrgbgen vertex\n}\n}\n",skin);
+	return R_RegisterShader(shname,SUF_NONE,body);
+}
+void Doom_LoadViewWeapon(int wi)
+{	//lazy main-thread load of a weapon's view + (optional) flash model; never call mid-render
+	char path[64]; model_t *m;
+	if (wi<0||wi>=9||doomvm[wi].tried) return;
+	doomvm[wi].tried = true;
+	Q_snprintfz(path,sizeof(path),"models/weapons/%s/view.md2",doomvmdir[wi]);
+	m = Mod_ForName(path, MLV_WARNSYNC);
+	if (m && m->type==mod_alias && m->loadstate==MLS_LOADED)
+		{ doomvm[wi].view=m; doomvm[wi].vsh=Doom_VMSkinShader(m,"doom_vm"); }
+	Q_snprintfz(path,sizeof(path),"models/weapons/%s/flash.md2",doomvmdir[wi]);
+	m = Mod_ForName(path, MLV_SILENTSYNC);	//fists/chainsaw have no flash - silent if missing
+	if (m && m->type==mod_alias && m->loadstate==MLS_LOADED)
+		{ doomvm[wi].flash=m; doomvm[wi].fsh=Doom_VMSkinShader(m,"doom_vmflash"); }
+}
+qboolean Doom_ViewModelActive(int wi)
+{	//true if a 3D viewmodel will draw for this weapon (so the 2D HUD weapon can stand down)
+	if (!(int)Cvar_Get("doom_viewmodel","1",CVAR_ARCHIVE,"Doom")->value) return false;
+	return wi>=0 && wi<9 && doomvm[wi].view && doomvm[wi].vsh;
+}
+static void Doom_DrawVMMesh(model_t *mod, shader_t *sh, int frame, const vec3_t base,
+                            const vec3_t fwd, const vec3_t right, const vec3_t up, float scale, unsigned int beflags)
+{	//CPU-transform an MD2 frame from model space (X fwd, Y left, Z up) into the view basis and bake
+	//to world coords (the backend draws xyz_array as world-space against the world entity).
+	galiasinfo_t *inf = Mod_Extradata(mod); galiaspose_t *pose; mesh_t mesh; int i, nv;
+	if (!inf || inf->numverts<=0 || frame<0 || frame>=inf->numanimations) return;
+	if (!inf->ofsanimations[frame].numposes) return;
+	pose = &inf->ofsanimations[frame].poseofs[0];
+	nv = inf->numverts;
+	if (nv>doommdlcap) { doommdlcap=nv+256; doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
+		doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t)); memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t)); }
+	for (i=0;i<nv;i++)
+	{
+		float mx=pose->ofsverts[i][0]*scale, my=pose->ofsverts[i][1]*scale, mz=pose->ofsverts[i][2]*scale;
+		doommdlxyz[i][0]=base[0]+fwd[0]*mx - right[0]*my + up[0]*mz;
+		doommdlxyz[i][1]=base[1]+fwd[1]*mx - right[1]*my + up[1]*mz;
+		doommdlxyz[i][2]=base[2]+fwd[2]*mx - right[2]*my + up[2]*mz;
+	}
+	memset(&mesh,0,sizeof(mesh));
+	mesh.numvertexes=nv; mesh.numindexes=inf->numindexes;
+	mesh.xyz_array=doommdlxyz; mesh.st_array=inf->ofs_st_array;
+	mesh.colors4b_array=doommdlcol; mesh.indexes=inf->ofs_indexes;
+	BE_DrawMesh_Single(sh,&mesh,NULL,beflags);
+}
+void Doom_DrawViewModel(void)
+{	//first-person weapon, drawn in the 3D pass attached to the camera. Positioned/scaled by cvars
+	//(doom_vm_scale/_fwd/_right/_up) since the exact fit can't be verified headless - tune by eye.
+	playerview_t *pv = r_refdef.playerview;
+	int wi, fi, health, frame; model_t *mod; shader_t *sh; galiasinfo_t *inf;
+	vec3_t fwd, right, up, base;
+	float scale, ofwd, oright, oup, lowerdist, dt;
+	static int vm_shown=-1, vm_target=-1; static double vm_last=0;
+
+	if (!cl.worldmodel || cl.worldmodel->fromgame!=fg_doom || !pv) return;
+	if (!(int)Cvar_Get("doom_viewmodel","1",CVAR_ARCHIVE,"Doom")->value) return;
+	health = pv->stats[STAT_HEALTH];
+	wi = pv->stats[STAT_ACTIVEWEAPON]; if (wi<0||wi>=9) wi=2;
+	fi = pv->stats[STAT_WEAPONFRAME];
+
+	//raise/lower state machine (mirrors the 2D HUD), expressed as a 0..1 fraction
+	dt=(vm_last>0)?(float)(realtime-vm_last):0; vm_last=realtime; if(dt<0)dt=0; else if(dt>0.1f)dt=0.1f;
+	if (health<=0){ vm_shown=vm_target=-1; doomvm_off=1; return; }	//dead: no weapon shown
+	if (vm_shown<0){ vm_shown=vm_target=wi; doomvm_off=0; }
+	if (wi!=vm_target) vm_target=wi;
+	if (vm_shown!=vm_target){ doomvm_off+=4.0f*dt; if(doomvm_off>=1){doomvm_off=1; vm_shown=vm_target;} }
+	else if (doomvm_off>0){ doomvm_off-=4.0f*dt; if(doomvm_off<0)doomvm_off=0; }
+	wi = vm_shown;
+
+	Doom_LoadViewWeapon(wi);
+	mod=doomvm[wi].view; sh=doomvm[wi].vsh;
+	if (!mod || !sh) return;
+	inf=Mod_Extradata(mod); if (!inf) return;
+
+	scale     = Cvar_Get("doom_vm_scale","1",CVAR_ARCHIVE,"Doom")->value;
+	ofwd      = Cvar_Get("doom_vm_fwd","8",CVAR_ARCHIVE,"Doom")->value;	//forward from the eye
+	oright    = Cvar_Get("doom_vm_right","0",CVAR_ARCHIVE,"Doom")->value;
+	oup       = Cvar_Get("doom_vm_up","-8",CVAR_ARCHIVE,"Doom")->value;	//down from the eye
+	lowerdist = Cvar_Get("doom_vm_lower","40",CVAR_ARCHIVE,"Doom")->value;	//switch drop distance
+
+	AngleVectors(r_refdef.viewangles, fwd, right, up);
+	VectorMA(r_refdef.vieworg, ofwd, fwd, base);
+	VectorMA(base, oright, right, base);
+	VectorMA(base, oup - doomvm_off*lowerdist, up, base);
+
+	frame = (fi>0 && fi<inf->numanimations) ? fi : 0;	//STAT_WEAPONFRAME -> view.md2 frame (0=idle)
+	//normal depth (beflags 0): the model self-occludes correctly and, being right at the camera,
+	//still draws over the world (it only clips when the eye is jammed into a wall - acceptable).
+	Doom_DrawVMMesh(mod, sh, frame, base, fwd, right, up, scale, 0);
+
+	//muzzle flash (additive) on fire frames, only when fully raised
+	if (doomvm[wi].flash && doomvm[wi].fsh && doomvm_off<=0 && fi>0)
+	{
+		galiasinfo_t *fin = Mod_Extradata(doomvm[wi].flash);
+		int ff = (fin && (fi-1)<fin->numanimations) ? (fi-1) : 0;
+		Doom_DrawVMMesh(doomvm[wi].flash, doomvm[wi].fsh, ff, base, fwd, right, up, scale, BEF_FORCEADDITIVE);
+	}
 }
 static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
 {	//render the monster's MD2 for the given phase/frame; false -> caller falls back to voxel/sprite
@@ -4886,8 +5093,8 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			if (!sprrot) rot = 0;	//doom_sprrot 0 = front view only (isolates the 8-rotation/mirror code)
 			sh = m->shader[wf][rot]; sw = m->w[wf][rot]; shh = m->h[wf][rot]; sxo = m->xo[wf][rot]; syo = m->yo[wf][rot];
 			mirror = sprrot ? m->wmir[wf][rot] : 0;
-			if (m->atk & MATK_BARREL)	//barrel idles by bobbing between BAR1 A and B (~0.17s each)
-				vlet = ((int)(m->animt/0.17f)&1) ? 'B' : 'A';
+			if (m->atk & MATK_BARREL)	//barrel is static in vanilla (sprite BAR1 A only) - no idle bob
+				vlet = 'A';
 			else { const char *ws=Doom_WalkFrames(m->spr); if(ws&&wf<(int)strlen(ws))vlet=ws[wf]; }
 		}
 		if ((usemod || usevox) && mph>=0)

@@ -476,6 +476,7 @@ typedef struct client_s
 	float                   doom_weapon_anim;       // drives the weapon's firing animation (seconds since fire)
 	qboolean		doom_wasonground;	// was the player on the ground last frame (edge-detect jumps for the jump sound)
 	float			doom_prevhealth;	// last-frame health, to detect pain (decrease) and death for player sounds
+	float			doom_stepdist;		// distance walked on the ground since the last footstep sound
 
 
 	qboolean		sendinfo;			// at end of frame, send info to all

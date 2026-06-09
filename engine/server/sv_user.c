@@ -49,6 +49,8 @@ void Doom_ActivateLinedef(struct model_s *model, int linedef_idx);
 void Doom_PlayerAttack(struct model_s *model, const float *org, float yaw, int pellets, int dmgbase, float maxrange);
 void Doom_PlayerProjectile(struct model_s *model, const vec3_t org, float yaw, int type);
 void Doom_PlaySound(const vec3_t org, const char *lump);
+void Doom_PlaySoundName(const vec3_t org, const char *name);
+const char *Doom_FootstepSound(struct model_s *model, const float *org);
 void Doom_PlayerFloorSnap(struct model_s *model, float *origin, float *velocity);
 int Doom_DoorKeyMask(int special);
 void Doom_SwitchUse(struct model_s *model, int linedef_idx);
@@ -7985,6 +7987,26 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 			if (host_client->doom_wasonground && !onground && sv_player->v->velocity[2] > 50)
 				Doom_PlaySound(sv_player->v->origin, "DSOOF");
 			host_client->doom_wasonground = onground;
+
+			//footsteps: while walking on the ground, play a surface-appropriate step every ~96 units
+			//travelled (distance-based, so cadence is framerate-independent). Primed to half the
+			//interval when stopped/airborne so the first step after you start moving lands promptly.
+			{
+				float vx = sv_player->v->velocity[0], vy = sv_player->v->velocity[1];
+				float spd2 = vx*vx + vy*vy;
+				if (onground && spd2 > 40.0f*40.0f)
+				{
+					host_client->doom_stepdist += sqrt(spd2) * host_frametime;
+					if (host_client->doom_stepdist >= 96.0f)
+					{
+						const char *fs = Doom_FootstepSound(sv.world.worldmodel, sv_player->v->origin);
+						if (fs) Doom_PlaySoundName(sv_player->v->origin, fs);
+						host_client->doom_stepdist = 0;
+					}
+				}
+				else
+					host_client->doom_stepdist = 48.0f;
+			}
 		}
 		VectorCopy(cur, host_client->doom_prevorg);
 	}

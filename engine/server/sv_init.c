@@ -843,9 +843,14 @@ static int QDECL SV_DoomPrecacheSound_cb(const char *fname, qofs_t fsize, time_t
 //ride out in the normal soundlist exactly like Quake's gamecode does it.
 void SV_DoomPrecacheSounds(void)
 {
+	extern const char *Doom_FootstepPrecacheName(int i);
+	const char *fs; int n;
 	int i = 1;
 	while (i < MAX_PRECACHE_SOUNDS && sv.strings.sound_precache[i]) i++;
 	COM_EnumerateFiles("wad/DS*", SV_DoomPrecacheSound_cb, &i);
+	//footstep samples (footsteps.pk3): one precache slot each, played by Doom_FootstepSound.
+	for (n = 0; (fs = Doom_FootstepPrecacheName(n)) != NULL && i < MAX_PRECACHE_SOUNDS-1; n++)
+		sv.strings.sound_precache[i++] = Z_StrDup(fs);
 }
 #endif
 
