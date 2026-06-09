@@ -7734,6 +7734,14 @@ void CL_ExecInitialConfigs(char *resetcommand, qboolean fullvidrestart)
 	if (COM_FCheckExists ("frontend.cfg"))
 		Cbuf_AddText ("exec frontend.cfg\n", RESTRICT_LOCAL);
 #endif
+#ifdef MAP_DOOM
+	//quoom: the inherited Quake default.cfg binds e=+moveup (and the embedded quake.rc does not
+	//exec autoexec.cfg in this build), so force the Doom autoexec.cfg to run LAST. It holds the
+	//Doom defaults - notably E=+use (doors/switches) and SPACE=+jump, which quoom needs as two
+	//distinct buttons. It stays user-editable: edits there still win since this is the last exec.
+	if (COM_CheckParm("-doom") || COM_CheckParm("-doom2"))
+		Cbuf_AddText ("exec autoexec.cfg\n", RESTRICT_LOCAL);
+#endif
 	Cbuf_AddText ("cl_warncmd 1\n", RESTRICT_LOCAL);	//and then it's allowed to start moaning.
 	COM_ParsePlusSets(true);
 

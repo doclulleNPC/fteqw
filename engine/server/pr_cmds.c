@@ -1996,10 +1996,22 @@ void Q_InitProgs(enum initprogs_e flags)
 			Q_strncpyz(addons, pr_ssqc_progs.string, MAX_QPATH);
 			COM_DefaultExtension(addons, ".dat", sizeof(addons));
 		}
+#ifdef MAP_DOOM
+		//Doom runs on the engine's native C sim, not QuakeC. Don't load any progs (so a Quake
+		//progs.dat in id1 can't bring Quake gamecode and spawn Quake entities on the Doom map);
+		//but DO run the rest of Q_InitProgs' setup above, then fall through to the no-gamecode path.
+		if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
+			oldprnum = -1;
+		else
+#endif
 		oldprnum= AddProgs(addons);
 
 		/*try to load qwprogs.dat if we didn't manage to load one yet*/
-		if (oldprnum < 0 && strcmp(addons, "qwprogs.dat"))
+		if (oldprnum < 0 && strcmp(addons, "qwprogs.dat")
+#ifdef MAP_DOOM
+			&& !(sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
+#endif
+			)
 		{
 #ifndef SERVERONLY
 			if (SCR_UpdateScreen)
@@ -2009,7 +2021,11 @@ void Q_InitProgs(enum initprogs_e flags)
 		}
 
 		/*try to load qwprogs.dat if we didn't manage to load one yet*/
-		if (oldprnum < 0 && strcmp(addons, "progs.dat"))
+		if (oldprnum < 0 && strcmp(addons, "progs.dat")
+#ifdef MAP_DOOM
+			&& !(sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
+#endif
+			)
 		{
 #ifndef SERVERONLY
 			if (SCR_UpdateScreen)

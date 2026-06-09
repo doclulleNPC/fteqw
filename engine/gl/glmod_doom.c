@@ -305,6 +305,7 @@ typedef struct doommap_s
 		qboolean move_floor;	// true if floor moves, false if ceiling
 		qboolean repeating;	// DR = reopens on use; D1 = stays open
 		int		special;	// original linedef special
+		vec3_t	sndorg;		// where door open/close sounds play (the trigger linedef midpoint)
 	} *doorsectors;
 	unsigned int numactive_doors;
 	unsigned int maxactive_doors;
@@ -577,15 +578,16 @@ static void Doom_ApplySpecialToSector(doommap_t *dm, int si, int special, int ta
 				d->wait_max = DOOR_WAIT;
 				// Target is lowest adjacent ceiling - 4
 				d->ceil_target = (short)Doom_FindLowestCeilingSurrounding(dm, si) - 4;
-				{	//door-open sound at the linedef midpoint
-					dlinedef_t *dl=&dm->linedef[linedef_idx]; vec3_t dorg;
-					dorg[0]=(dm->vertexes[dl->vert[0]].xpos+dm->vertexes[dl->vert[1]].xpos)*0.5f;
-					dorg[1]=(dm->vertexes[dl->vert[0]].ypos+dm->vertexes[dl->vert[1]].ypos)*0.5f;
-					dorg[2]=dm->sector[si].floorheight+48;
-					Doom_PlaySound(dorg, "DSDOROPN");
+				{	//door-open sound at the linedef midpoint; remember it for the close sound too
+					dlinedef_t *dl=&dm->linedef[linedef_idx];
+					d->sndorg[0]=(dm->vertexes[dl->vert[0]].xpos+dm->vertexes[dl->vert[1]].xpos)*0.5f;
+					d->sndorg[1]=(dm->vertexes[dl->vert[0]].ypos+dm->vertexes[dl->vert[1]].ypos)*0.5f;
+					d->sndorg[2]=dm->sector[si].floorheight+48;
+					Doom_PlaySound(d->sndorg, "DSDOROPN");
 				}
-			} else if (d->state == 2 && d->repeating) {
-				d->state = 3; // close now
+			} else if ((d->state == 1 || d->state == 2) && d->repeating && !d->move_floor) {
+				d->state = 3; // re-USE on an open/opening door: close it now (DR toggle)
+				Doom_PlaySound(d->sndorg, "DSDORCLS");
 			}
 			break;
 
@@ -599,6 +601,14 @@ static void Doom_ApplySpecialToSector(doommap_t *dm, int si, int special, int ta
 				d->wait_max = PLAT_WAIT;
 				d->floor_target = Doom_FindLowestFloorSurrounding(dm, si);
 				d->floor_original = dm->sector[si].floorheight;
+				{	//lift start sound at the trigger linedef midpoint (reused for the stop sound too).
+					//Vanilla plats play sfx_pstart on departure / sfx_pstop on arrival at each end.
+					dlinedef_t *dl=&dm->linedef[linedef_idx];
+					d->sndorg[0]=(dm->vertexes[dl->vert[0]].xpos+dm->vertexes[dl->vert[1]].xpos)*0.5f;
+					d->sndorg[1]=(dm->vertexes[dl->vert[0]].ypos+dm->vertexes[dl->vert[1]].ypos)*0.5f;
+					d->sndorg[2]=dm->sector[si].floorheight+8;
+					Doom_PlaySound(d->sndorg, "DSPSTART");
+				}
 			}
 			break;
 
@@ -839,6 +849,8 @@ void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 				if (sec->floorheight >= d->floor_target) {
 					sec->floorheight = d->floor_target;
 					d->state = 0; // done
+					if (d->special==10||d->special==88||d->special==62||d->special==123)
+						Doom_PlaySound(d->sndorg, "DSPSTOP");	//lift arrived back at the top
 				}
 			} else {
 				sec->ceilingheight += move;
@@ -855,9 +867,16 @@ void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 			{	//a lift at the bottom returns UP (raise to its original height); doors/floors lower.
 				//Without this the floor-lower path snapped the lift up instantly (target above current).
 				if (d->move_floor && d->floor_target > sec->floorheight)
+				{
 					d->state = 1; // lift rising back up
+					Doom_PlaySound(d->sndorg, "DSPSTART");	//lift departing the bottom
+				}
 				else
+				{
 					d->state = 3; // door closing / floor lowering
+					if (!d->move_floor)	//a ceiling door starting to close: play the close sound
+						Doom_PlaySound(d->sndorg, "DSDORCLS");
+				}
 			}
 			break;
 		case 3:	// lowering
@@ -870,6 +889,7 @@ void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 						d->state = 2; d->wait_time = d->wait_max;
 						d->floor_target = d->floor_original;
 						d->repeating = false; // final return
+						Doom_PlaySound(d->sndorg, "DSPSTOP");	//lift arrived at the bottom
 					} else d->state = 0;
 				}
 			} else {
@@ -1016,6 +1036,25 @@ static void Doom_LineOpening(dlinedef_t *ld, doommap_t *dm, float *opentop, floa
 	}
 }
 
+//solid scenery (Doom MF_SOLID decorations) blocks movement, modelled as a thin cylinder. Items,
+//gore, candles and hanging bodies are non-solid (0). Floor-standing obstacles only - so you can
+//still walk under hanging corpses.
+static float Doom_ThingSolidRadius(unsigned short type)
+{
+	switch(type)
+	{
+	case 54: return 32;	//TRE2 big brown tree
+	case 2028:		//COLU floor lamp
+	case 30: case 31: case 32: case 33: case 36: case 37:	//COL1-6 columns
+	case 48:		//ELEC tall tech column
+	case 43:		//TRE1 burnt tree
+	case 47:		//SMIT stalagmite
+	case 35:		//CBRA candelabra
+		return 16;
+	default: return 0;
+	}
+}
+
 static qboolean Doom_CheckPosition(doommap_t *dm, float x, float y, float radius, float height, float feetz, const vec3_t dir, dlinedef_t **hitline, float *tmfloorz, float *tmceilingz, float *tmdropoffz)
 {
 	int xl, xh, yl, yh, bx, by;
@@ -1096,6 +1135,22 @@ static qboolean Doom_CheckPosition(doommap_t *dm, float x, float y, float radius
 	//"don't stand over a dropoff" test is skipped for the player - they can walk off ledges and the
 	//sides of stairs. (Only monsters, which lack MF_DROPOFF, avoid dropoffs - see Doom_MonsterBlocked.)
 	(void)dropline;
+	//solid scenery (pillars/columns/trees/...) blocks: circle-vs-circle against each obstacle.
+	{
+		unsigned int si;
+		for (si = 0; si < dm->numsprites; si++)
+		{
+			float sr = Doom_ThingSolidRadius(dm->sprites[si].type);
+			float dx, dy, rr;
+			if (sr <= 0) continue;
+			dx = dm->sprites[si].origin[0]-x; dy = dm->sprites[si].origin[1]-y; rr = radius + sr;
+			if (dx*dx + dy*dy < rr*rr)
+			{
+				if (hitline) *hitline = NULL;	//Doom_Trace will stop the move on the obstacle
+				return false;
+			}
+		}
+	}
 	return true;
 }
 
@@ -2868,6 +2923,20 @@ int Doom_DoorKeyMask(int special)
 	default: return 0;
 	}
 }
+//USE-activated one-shot specials (D1 doors, S1 switches, exits): zero the line after use so they
+//can't be triggered again. DR/SR (repeatable) specials are NOT listed.
+int Doom_OneShotUse(int special)
+{
+	switch(special)
+	{
+	case 31: case 32: case 33: case 34: case 118:	//D1 doors (open, stay)
+	case 103:					//S1 door open stay
+	case 11: case 51: case 52: case 124:		//exits
+	case 123:					//S1 fast lift
+		return 1;
+	default: return 0;
+	}
+}
 
 //=============================== Doom status-bar HUD (2D) =================================
 // Faithful bottom status bar (STBAR) + first-person weapon, drawn in screen space via R2D_Image
@@ -2929,21 +2998,64 @@ void Doom_DrawHUD2D(void)
 	R2D_ImageColours(1,1,1,1);
 
 	//---- first-person weapon, just above the status bar (not while dead) ----
+	// Doom raises/lowers the weapon on a switch instead of swapping it instantly: the weapon
+	// the player is leaving drops off the bottom, then the new one rises up into place. We drive
+	// this purely client-side off STAT_ACTIVEWEAPON changes (the server already switched), tracking
+	// a vertical offset in virtual pixels (0 = rested, DW_DOWN = fully hidden below the screen).
 	wi=st[STAT_ACTIVEWEAPON]; fi=st[STAT_WEAPONFRAME];
 	if (wi<0||wi>=9) wi=2;
-	if (health > 0)
 	{
-		char lump[24]; char frame='A'; doomhudpic_t *wp;
-		float f = Cvar_Get("doom_weaponscale","0.7",CVAR_ARCHIVE,"Doom")->value;	//view-weapon size
-		if (fi>=0 && (unsigned)fi<strlen(wanims[wi])) frame=wanims[wi][fi];
-		Q_snprintfz(lump,sizeof(lump),"sprites/%sG%c0",wnames[wi],frame);
-		wp=Doom_HudPic(lump);
-		if (wp && wp->sh)
-			//Doom weapon sprites use psprite offsets authored so that V_DrawPatch at virtual (0,0)
-			//centres them and rests the bottom on the 168-line (status-bar top). doom_weaponscale
-			//shrinks the weapon about that bottom-centre anchor (160,168) so it isn't oversized.
-			R2D_Image(xoff + (160 + (-wp->xo-160)*f)*scale, (168 - wp->h*f)*scale,
-			          wp->w*f*scale, wp->h*f*scale, 0,0,1,1, wp->sh);
+		#define DW_DOWN  140.0f		//virtual px to drop the weapon fully out of sight
+		#define DW_SPEED 560.0f		//raise/lower speed in virtual px/sec (~0.25s each way)
+		static int    dw_shown   = -1;	//weapon sprite currently on screen (may lag the server)
+		static int    dw_target  = -1;	//weapon the server wants us to show
+		static float  dw_off     = 0;	//current vertical offset (0=up, DW_DOWN=hidden)
+		static double dw_lasttime= 0;
+		float dt = (dw_lasttime>0) ? (float)(realtime - dw_lasttime) : 0;
+		dw_lasttime = realtime;
+		if (dt < 0) dt = 0; else if (dt > 0.1f) dt = 0.1f;	//clamp (paused/first frame)
+
+		if (health <= 0)
+		{	//dead: forget state so the next spawn raises the starting weapon fresh
+			dw_shown = dw_target = -1; dw_off = 0;
+		}
+		else
+		{
+			if (dw_shown < 0) { dw_shown = dw_target = wi; dw_off = 0; }	//first frame: no animation
+			if (wi != dw_target) dw_target = wi;				//switch requested -> lower current first
+
+			if (dw_shown != dw_target)
+			{	//lowering the outgoing weapon; swap to the new one once fully hidden
+				dw_off += DW_SPEED * dt;
+				if (dw_off >= DW_DOWN) { dw_off = DW_DOWN; dw_shown = dw_target; }
+			}
+			else if (dw_off > 0)
+			{	//raising the (new) weapon into place
+				dw_off -= DW_SPEED * dt;
+				if (dw_off < 0) dw_off = 0;
+			}
+		}
+
+		if (health > 0)
+		{
+			char lump[24]; char frame='A'; doomhudpic_t *wp;
+			float f = Cvar_Get("doom_weaponscale","0.7",CVAR_ARCHIVE,"Doom")->value;	//view-weapon size
+			int dwi = dw_shown;					//draw the sprite that is actually on screen
+			if (dwi<0||dwi>=9) dwi=wi;
+			//only use the server's fire frame once settled & raised; show idle while moving
+			if (dwi==wi && dw_off<=0 && fi>=0 && (unsigned)fi<strlen(wanims[dwi])) frame=wanims[dwi][fi];
+			Q_snprintfz(lump,sizeof(lump),"sprites/%sG%c0",wnames[dwi],frame);
+			wp=Doom_HudPic(lump);
+			if (wp && wp->sh)
+				//Doom weapon sprites use psprite offsets authored so that V_DrawPatch at virtual (0,0)
+				//centres them and rests the bottom on the 168-line (status-bar top). doom_weaponscale
+				//shrinks the weapon about that bottom-centre anchor (160,168) so it isn't oversized.
+				//dw_off slides it down for the raise/lower switch animation.
+				R2D_Image(xoff + (160 + (-wp->xo-160)*f)*scale, (168 - wp->h*f + dw_off)*scale,
+				          wp->w*f*scale, wp->h*f*scale, 0,0,1,1, wp->sh);
+		}
+		#undef DW_DOWN
+		#undef DW_SPEED
 	}
 
 	//---- status bar background + arms panel ----
@@ -3292,8 +3404,12 @@ static qboolean Doom_SightLine(doommap_t *dm, const vec3_t a, const vec3_t b)
 		u = (qmx*ady - qmy*adx) / denom;	//param along the linedef
 		if (t <= 0.001f || t >= 0.999f || u < 0.0f || u > 1.0f)
 			continue;	//crossing not strictly between the two endpoints / off the wall
-		//one-sided (or non-two-sided) linedef = solid wall: blocks sight
-		if (ld->sidedef[1] == 0xffff || !(ld->flags & LINEDEF_TWOSIDED))
+		//Only a genuinely one-sided linedef (no back sidedef) is a solid wall that blocks a
+		//hitscan. Do NOT use the ML_TWOSIDED flag (some sector-boundary lines clear it, which
+		//made the player's shots get eaten by invisible lines while monsters - which test
+		//sidedef[1] - shot back fine), and do NOT block on ML_IMPASSABLE (railings stop movement
+		//but not bullets). This matches Doom_CheckPosition and the monster sight test.
+		if (ld->sidedef[1] == 0xffff)
 			return false;
 		//two-sided: sight passes only through the open gap between the sectors
 		fs = &dm->sector[dm->sidedef[ld->sidedef[0]].sector];
@@ -3401,11 +3517,13 @@ static void Doom_HurtMonster(doommap_t *dm, struct doommonster_s *m, int damage)
 	}
 	else
 	{
-		if (m->painfr[0])
-			m->paintime = 0;	//trigger pain animation (100% chance for now, vanilla is random)
-		Doom_PlaySound(m->origin, Doom_MonSound(m->spr,1));
-		if (!(m->atk & MATK_BARREL))
+		if (!(m->atk & MATK_BARREL))	//a shot barrel takes damage silently (no human pain sound/anim/blood)
+		{
+			if (m->painfr[0])
+				m->paintime = 0;	//trigger pain animation (100% chance for now, vanilla is random)
+			Doom_PlaySound(m->origin, Doom_MonSound(m->spr,1));
 			Doom_AddFX(dm, hit, DFX_BLOOD);	//blood spurt on every hit
+		}
 	}
 }
 
@@ -3948,6 +4066,9 @@ void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, 
 				if (drop) Doom_SpawnDrop(dm, drop, m->origin);
 			}
 			if (m->deathtime >= 0) m->deathtime += frametime;
+			//a corpse rides its sector's floor (falls when it lowers / rises with a lift) instead of
+			//hovering where the monster died - the gibbed-imps-floating-in-air case.
+			{ msector_t *fs = Doom_SectorNearPoint(dm, m->origin); if (fs) m->origin[2] = fs->floorheight; }
 			continue;
 		}
 		if (m->atk & MATK_BARREL)
@@ -4166,7 +4287,10 @@ static void Doom_NoiseAlert(doommap_t *dm, const vec3_t noiseorg)
 		if (!ms) continue;
 		si = (int)(ms - dm->sector);
 		if (si >= 0 && si < (int)dm->numsectors && vis[si])
+		{	//Doom A_Look plays the sight sound when a monster wakes - by sound as well as by sight
 			m->alerted = 1;
+			Doom_PlaySound(m->origin, Doom_MonSound(m->spr,0));
+		}
 	}
 	Z_Free(queue);
 	Z_Free(vis);

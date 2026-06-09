@@ -52,6 +52,7 @@ void Doom_PlaySound(const vec3_t org, const char *lump);
 void Doom_PlayerFloorSnap(struct model_s *model, float *origin, float *velocity);
 int Doom_DoorKeyMask(int special);
 void Doom_SwitchUse(struct model_s *model, int linedef_idx);
+int Doom_OneShotUse(int special);
 void Doom_ResetMap(struct model_s *model);
 qboolean Doom_TeleportThing(struct model_s *model, int linedef_idx, float *outorg, float *outyaw);
 void Doom_TryPickups(struct model_s *model, const float *playerorg, float *health, float *armor,
@@ -7837,8 +7838,12 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 		sv_player->v->impulse = ucmd->impulse;
 
 #ifdef MAP_DOOM
-	// On DOOM maps: when player presses jump/use (button2) scan forward for
-	// an activatable linedef and open it.
+	// On DOOM maps: when player presses USE (the +use button, NOT jump) scan
+	// forward for an activatable linedef and open it.
+	// +use maps to button bit 8 (NetQuake) or bit 4 (QuakeWorld); jump is bit 1
+	// (=button2), so we must read the raw usercmd bit here - button2 would make
+	// the jump key open doors (and there is no QC field for the use bit in Doom mode).
+	#define DOOM_USEBIT(b) ((b) & ((1u<<8)|(1u<<4)))
 	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
 	{
 		doommap_sv_t *dm = (doommap_sv_t*)sv.world.worldmodel->meshinfo;
@@ -7847,7 +7852,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 		int j;
 		float best_dist = 64.0f;	// max USE reach (DOOM: ~64 units)
 		int best_ld = -1;
-		qboolean useedge = sv_player->v->button2 && !host_client->doom_use_pressed;	//manual USE this frame
+		qboolean useedge = DOOM_USEBIT(ucmd->buttons) && !host_client->doom_use_pressed;	//manual USE this frame
 
 		yaw = sv_player->v->angles[1] * M_PI / 180.0f;
 		fwd[0] = cos(yaw);  fwd[1] = sin(yaw);  fwd[2] = 0;
@@ -7875,25 +7880,54 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 			best_dist = dist;
 			best_ld = j;
 		}
-		// open on a USE press, or automatically the first frame you face a door on approach
-		// (debounced via doom_autouse_ld so an already-open door isn't re-triggered/oscillated).
-		if (best_ld >= 0 && (useedge || best_ld != host_client->doom_autouse_ld))
+		// open ONLY on a USE press (Doom-like). The old auto-open-on-approach made doors close on a
+		// player standing in the doorway (then re-blocked them) and triggered switches just by walking
+		// toward them - both of which the player reported.
+		if (best_ld >= 0 && useedge)
 		{
-			int keymask = Doom_DoorKeyMask(dm->linedef[best_ld].types);
+			int special = dm->linedef[best_ld].types;
+			int keymask = Doom_DoorKeyMask(special);
 			if (keymask && !((int)sv_player->v->items & keymask))
-			{	//locked: missing the required key - don't open (vanilla plays "oof"/"no way")
-				if (useedge)
-					Doom_PlaySound(sv_player->v->origin, "DSNOWAY");
-			}
+				Doom_PlaySound(sv_player->v->origin, "DSNOWAY");	//locked: missing the key
 			else
 			{
 				Doom_ActivateLinedef(sv.world.worldmodel, best_ld);
 				Doom_SwitchUse(sv.world.worldmodel, best_ld);	//flip the switch texture (no-op for non-switches)
+				if (Doom_OneShotUse(special))
+					dm->linedef[best_ld].types = 0;		//S1/D1/exit switch: usable only once
+			}
+		}
+		else if (useedge)
+		{	//USE pressed but nothing activatable in front: if we're facing a solid (one-sided)
+			//wall within reach, grunt (DSOOF) so the press isn't silent. A short forward ray (48
+			//units) keeps it quiet when using in open space.
+			float r0x=pos[0], r0y=pos[1], rdx=fwd[0]*48.0f, rdy=fwd[1]*48.0f;
+			for (j = 0; j < (int)dm->numlinedefs; j++)
+			{
+				dlinedef_sv_t *ld = dm->linedef + j;
+				mdoomvertex_sv_t *v1, *v2;
+				float lx, ly, denom, qmx, qmy, t, u;
+				if (ld->sidedef[1] != 0xffff)
+					continue;	//two-sided: not a solid wall (doors/passages are handled above)
+				v1 = &dm->vertexes[ld->vert[0]];
+				v2 = &dm->vertexes[ld->vert[1]];
+				lx = v2->xpos - v1->xpos;  ly = v2->ypos - v1->ypos;
+				denom = rdx*ly - rdy*lx;
+				if (denom > -1e-6f && denom < 1e-6f)
+					continue;	//ray parallel to the wall
+				qmx = v1->xpos - r0x;  qmy = v1->ypos - r0y;
+				t = (qmx*ly  - qmy*lx ) / denom;	//param along the ray [0,1]
+				u = (qmx*rdy - qmy*rdx) / denom;	//param along the wall [0,1]
+				if (t < 0.0f || t > 1.0f || u < 0.0f || u > 1.0f)
+					continue;
+				Doom_PlaySound(sv_player->v->origin, "DSOOF");	//bumped a solid wall
+				break;
 			}
 		}
 		host_client->doom_autouse_ld = best_ld;
 	}
-	host_client->doom_use_pressed = sv_player->v->button2 ? true : false;
+	host_client->doom_use_pressed = DOOM_USEBIT(ucmd->buttons) ? true : false;
+	#undef DOOM_USEBIT
 
 	// DOOM walk-over triggers (W1 / WR specials): level exits, floor traps, teleporters, etc.
 	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom && sv_player->v->health > 0)
@@ -7945,6 +7979,13 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 		}
 		//ride rising lifts / finish step-ups: lift the player onto the floor they're standing in
 		Doom_PlayerFloorSnap(sv.world.worldmodel, sv_player->v->origin, sv_player->v->velocity);
+		{	//jump grunt: just left the ground moving upward (Quake has no jump sample, so use the
+			//player "oof" grunt). Edge-detected so it fires once per jump, not every airborne frame.
+			qboolean onground = ((int)sv_player->v->flags & FL_ONGROUND) != 0;
+			if (host_client->doom_wasonground && !onground && sv_player->v->velocity[2] > 50)
+				Doom_PlaySound(sv_player->v->origin, "DSOOF");
+			host_client->doom_wasonground = onground;
+		}
 		VectorCopy(cur, host_client->doom_prevorg);
 	}
 
@@ -7953,6 +7994,14 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 	// us) the fire button instead respawns at the start with a fresh inventory.
 	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
 	{
+		{	//player pain / death sound (vanilla DSPLPAIN / DSPLDETH) on a health drop.
+			//Only fire while the player WAS alive (prevhealth>0): otherwise damage to the
+			//corpse (hp 0 -> -3 -> -6 ...) would replay DSPLDETH every frame -> endless loop.
+			float hp = sv_player->v->health;
+			if (hp < host_client->doom_prevhealth && host_client->doom_prevhealth > 0)
+				Doom_PlaySound(sv_player->v->origin, (hp <= 0) ? "DSPLDETH" : "DSPLPAIN");
+			host_client->doom_prevhealth = hp;
+		}
 		if (sv_player->v->health <= 0)
 		{
 			if (sv_player->v->button0 && !host_client->doom_attack_pressed)
@@ -8032,7 +8081,12 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 					host_client->doom_weapon_anim = 0; //start animation
 				}
 				else
-					host_client->doom_refire = 0.2f;	//out of ammo: empty click delay
+				{	//out of ammo: dry-fire click (DSTINK) on the trigger press, then a short delay.
+					//Gating on the press edge avoids a 5/sec click machine-gun while fire is held.
+					if (!host_client->doom_attack_pressed)
+						Doom_PlaySound(sv_player->v->origin, "DSTINK");
+					host_client->doom_refire = 0.2f;	//empty click delay
+				}
 			}
 
 			//update STAT_WEAPONFRAME for the HUD weapon animation (index into wp->anim; 0 = idle/Ready).

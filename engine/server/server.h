@@ -474,6 +474,8 @@ typedef struct client_s
 	vec3_t			doom_prevorg;		// previous-frame origin, for walk-over teleport line crossing
 	float                   doom_refire;            // time left until the equipped Doom weapon can fire again (per-weapon refire rate)
 	float                   doom_weapon_anim;       // drives the weapon's firing animation (seconds since fire)
+	qboolean		doom_wasonground;	// was the player on the ground last frame (edge-detect jumps for the jump sound)
+	float			doom_prevhealth;	// last-frame health, to detect pain (decrease) and death for player sounds
 
 
 	qboolean		sendinfo;			// at end of frame, send info to all
