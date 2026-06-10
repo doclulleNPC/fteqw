@@ -14,6 +14,7 @@ static shader_t *Doom_SpriteShaderFor(const char *lump, texid_t tex);
 static void Doom_VoxShader(void);
 static qboolean Doom_DrawVoxelByName(const char *name, const vec3_t origin, float yawdeg, float scale);
 static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale);
+static qboolean Doom_HasModel(const char *spr);	//does an MD2/IQM model def exist for this sprite?
 static void Doom_EmitFX(doommap_t *dm);	//drain dm->fx -> particle effects (client render)
 //MD2 animation phases (doommodels.def): monster walk/attack/pain/die/gib; decorations use 'walk' for idle/spin.
 #define DMDL_WALK   0
@@ -1905,20 +1906,24 @@ static void R_DoomDrawSprites(doommap_t *dm)
 		  if (sm == 2) { float fy=(float)(atan2(r_refdef.vieworg[1]-s->origin[1], r_refdef.vieworg[0]-s->origin[0])*(180.0/M_PI)); vyaw=fy; myaw=fy; }
 		  else if (sm == 1 || s->pickup) { float sp=(float)(realtime*spinrate); vyaw+=sp; myaw+=sp; } }
 		vec3_t l, r;
+		char pfx[5];
+		qboolean hasmodel;
+		pfx[0]=s->voxname[0]; pfx[1]=s->voxname[1]; pfx[2]=s->voxname[2]; pfx[3]=s->voxname[3]; pfx[4]=0;
+		//one render mode per thing: if it has an MD2 def, it's an MD2 thing - never fall to voxel
+		//(missing -> sprite), so we never mix MD2 and voxel on the same object.
+		hasmodel = usemod && (Doom_HasModel(s->voxname) || Doom_HasModel(pfx));
 		if (usemod && s->voxname[0])
 		{	//MD2 model for this decoration/pickup, if a def exists. Try the full sprite+frame name
-			//first (e.g. PLAYN dead vs PLAYW gibbed share the PLAY prefix), then the 4-char sprite
-			//prefix (items/keys/gore/bodies). The "walk" phase holds the idle/spin frames; count=0
-			//steps `spin` through them directly.
-			char pfx[5]; vec3_t mo;
-			pfx[0]=s->voxname[0]; pfx[1]=s->voxname[1]; pfx[2]=s->voxname[2]; pfx[3]=s->voxname[3]; pfx[4]=0;
+			//first (e.g. PLAYN dead vs PLAYW gibbed share the PLAY prefix), then the 4-char prefix.
+			//The "walk" phase holds the idle/spin frames; count=0 steps `spin` through them directly.
+			vec3_t mo;
 			VectorCopy(s->origin, mo); mo[2]+=modz;
 			if (Doom_DrawModel(s->voxname, DMDL_WALK, spin, 0, mo, myaw, modscale) ||
 			    Doom_DrawModel(pfx,        DMDL_WALK, spin, 0, mo, myaw, modscale))
 				continue;
 		}
-		if (usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, vyaw, voxscale))
-			continue;	//rendered as a voxel; otherwise fall back to the sprite billboard
+		if (!hasmodel && usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, vyaw, voxscale))
+			continue;	//voxel only when there's no MD2 def (never mix); otherwise fall back to the sprite
 		if (!s->shader)
 			continue;
 		VectorMA(s->origin, -s->xo,        vright, l);	//left edge (origin column = leftoffset)
@@ -4811,7 +4816,7 @@ static void Doom_LoadModelDef(void)
 	//parsed FIRST so they win in Doom_GetModel's first-match lookup; xmodels.pk3 covers the rest.
 	if (doommodelsloaded) return;
 	doommodelsloaded=true;
-	if ((int)Cvar_Get("doom_hd","0",CVAR_ARCHIVE,"Doom")->value)
+	if ((int)Cvar_Get("doom_hd","0",CVAR_ARCHIVE,"Doom")->value)	//opt-in: DHMP IQMs are skeletal and not renderable by this path yet
 		Doom_ParseModelDef("doommodels_dhmp.def");
 	Doom_ParseModelDef("doommodels.def");
 }
@@ -4821,6 +4826,7 @@ static doommodel_t *Doom_GetModel(const char *spr)
 	for (i=0;i<doommodelcount;i++) if(!strcmp(doommodels[i].spr,spr)) return &doommodels[i];
 	return NULL;
 }
+static qboolean Doom_HasModel(const char *spr) { return spr && spr[0] && Doom_GetModel(spr)!=NULL; }
 static qboolean Doom_ModelSlot(doommodel_t *dm, int slot, model_t **pmod, shader_t **psh)
 {	//lazily load the slot's MD2 + build a shader for its embedded skin
 	if (!dm->modtried[slot])
@@ -4963,10 +4969,10 @@ void Doom_DrawViewModel(void)
 	if (!mod || !sh) return;
 	inf=Mod_Extradata(mod); if (!inf) return;
 
-	scale     = Cvar_Get("doom_vm_scale","1.3",CVAR_ARCHIVE,"Doom")->value;	//overall size multiplier (after per-model normalisation)
+	scale     = Cvar_Get("doom_vm_scale","1.6",CVAR_ARCHIVE,"Doom")->value;	//overall size multiplier (after per-model normalisation)
 	ofwd      = Cvar_Get("doom_vm_fwd","4",CVAR_ARCHIVE,"Doom")->value;	//forward from the eye (closer = bigger/nearer)
 	oright    = Cvar_Get("doom_vm_right","3",CVAR_ARCHIVE,"Doom")->value;	//+ = to the right
-	oup       = Cvar_Get("doom_vm_up","-10",CVAR_ARCHIVE,"Doom")->value;	//- = position of the weapon's TOP below the eye
+	oup       = Cvar_Get("doom_vm_up","-14",CVAR_ARCHIVE,"Doom")->value;	//- = position of the weapon's TOP below the eye (lower = more "held"/towards player)
 	lowerdist = Cvar_Get("doom_vm_lower","40",CVAR_ARCHIVE,"Doom")->value;	//switch drop distance
 
 	frame = (fi>0 && fi<inf->numanimations) ? fi : 0;	//STAT_WEAPONFRAME -> view.md2 frame (0=idle)
@@ -5084,27 +5090,39 @@ static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, c
 	{
 		galiaspose_t *pose; shader_t *ssh; int f2=frame; const char *snm=surf->surfacename;
 		if (surf->numverts<=0 || surf->numanimations<=0) continue;
-		//skip the "death"/exploded sub-meshes on a live thing (the DHMP barrel packs both in one model)
-		if (snm && (strstr(snm,"death") || strstr(snm,"_dead"))) continue;
+		//Skip "death"/exploded sub-meshes only on a LIVE phase - the DHMP barrel packs its intact and
+		//exploded geometry in one model, so a standing barrel must not show the wreckage. But a
+		//separate MD2 death model (trooper/death.md2) has a surface called "death" that we MUST draw
+		//for the die phase, so only hide death surfaces when not actually dying/gibbing.
+		if (phase!=DMDL_DIE && phase!=DMDL_GIB && snm && (strstr(snm,"death") || strstr(snm,"_dead"))) continue;
 		if (f2<0 || f2>=surf->numanimations) f2=0;	//clamp the frame per-surface
-		if (!surf->ofsanimations[f2].numposes) continue;
-		pose=&surf->ofsanimations[f2].poseofs[0];
-		ssh=Doom_SurfaceShader(surf, sh);
-		if (!ssh) continue;
-		nv=surf->numverts;
-		if (nv>doommdlcap)
+		//Vertex source: MD2s store baked per-frame verts in poseofs[].ofsverts. Skeletal models (the
+		//DHMP IQMs) store NO baked verts - their geometry needs bone-skinning, which this simple path
+		//doesn't do; their raw bind verts are at arbitrary scale/layout (the joints carry the real
+		//transform), so we can't draw them here. Reading ofsverts on a skeletal model would also
+		//dereference NULL -> crash. So use the baked pose verts and SKIP any surface without them
+		//(skeletal/IQM) - the caller then falls back (per the no-mix rule, to the sprite).
+		pose = (surf->ofsanimations[f2].numposes>0) ? &surf->ofsanimations[f2].poseofs[0] : NULL;
 		{
-			doommdlcap=nv+256;
-			doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
-			doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
-			memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
-		}
-		for (i=0;i<nv;i++)
-		{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet
-			float lx=pose->ofsverts[i][0]*scale, ly=pose->ofsverts[i][1]*scale, lz=pose->ofsverts[i][2]*scale;
-			doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
-			doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
-			doommdlxyz[i][2]=origin[2]+lz;
+			vecV_t *vsrc = (pose && pose->ofsverts) ? pose->ofsverts : NULL;
+			if (!vsrc || !surf->ofs_st_array || !surf->ofs_indexes) continue;
+			ssh=Doom_SurfaceShader(surf, sh);
+			if (!ssh) continue;
+			nv=surf->numverts;
+			if (nv>doommdlcap)
+			{
+				doommdlcap=nv+256;
+				doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
+				doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
+				memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
+			}
+			for (i=0;i<nv;i++)
+			{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet
+				float lx=vsrc[i][0]*scale, ly=vsrc[i][1]*scale, lz=vsrc[i][2]*scale;
+				doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
+				doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
+				doommdlxyz[i][2]=origin[2]+lz;
+			}
 		}
 		memset(&mesh,0,sizeof(mesh));
 		mesh.numvertexes=nv; mesh.numindexes=surf->numindexes;
@@ -5229,13 +5247,18 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			VectorSubtract(m->origin, r_refdef.vieworg, tom);
 			if (DotProduct(tom, vpn) < -96) continue;
 		}
+		//Pick ONE render mode per monster and stick to it across all animation phases - never mix
+		//MD2 and voxel (looks jarring, e.g. an MD2 walk then a voxel death). If this monster has an
+		//MD2 def at all it's an "MD2 thing": render MD2, and if a phase's MD2 is missing fall back to
+		//the SPRITE, not the voxel. Only monsters with no MD2 def use voxels.
+		qboolean hasmodel = usemod && Doom_HasModel(m->spr);
 		if (usemod && mph>=0)
-		{	//MD2 model for this monster+phase, if a def exists; else fall through to voxel/sprite
+		{	//MD2 model for this monster+phase
 			vec3_t mo; VectorCopy(m->origin, mo); mo[2]+=modz;
 			if (Doom_DrawModel(m->spr, mph, midx, mcount, mo, m->yaw+modyaw, modscale)) continue;
 		}
-		if (usevox && vlet && vbase)
-		{	//voxel model for this frame, if one exists; otherwise fall through to the sprite
+		if (!hasmodel && usevox && vlet && vbase)
+		{	//voxel model for this frame (only when there's no MD2 def, so we never mix the two)
 			char vn[16];
 			Q_snprintfz(vn,sizeof(vn),"%s%c",vbase,vlet);
 			if (Doom_DrawVoxelByName(vn, m->origin, m->yaw+voxyaw, voxscale)) continue;
