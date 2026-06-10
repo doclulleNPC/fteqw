@@ -3005,7 +3005,7 @@ void Doom_DrawHUD2D(void)
 	float scale, xoff;
 	static const int armbits[6]={DWEP_PISTOL, DWEP_SHOTGUN|DWEP_SSG, DWEP_CHAINGUN, DWEP_ROCKET, DWEP_PLASMA, DWEP_BFG};
 	static const char *wnames[9]={"PUN","SAW","PIS","SHT","SHT2","CHG","MIS","PLS","BFG"};
-	static const char *wanims[9]={"ABCD","AB","ABCD","ABCD","ABCDEFGHIJ","AB","AB","AB","AB"};
+	static const char *wanims[9]={"ABCD","AB","ABCD","ABCDCB","ABCDEFGHIJ","AB","AB","AB","AB"};
 
 	if (!cl.worldmodel || cl.worldmodel->loadstate!=MLS_LOADED || cl.worldmodel->fromgame!=fg_doom)
 		return;
@@ -3063,17 +3063,32 @@ void Doom_DrawHUD2D(void)
 			float f = Cvar_Get("doom_weaponscale","0.7",CVAR_ARCHIVE,"Doom")->value;	//view-weapon size
 			int dwi = dw_shown;					//draw the sprite that is actually on screen
 			if (dwi<0||dwi>=9) dwi=wi;
+
 			//only use the server's fire frame once settled & raised; show idle while moving
-			if (dwi==wi && dw_off<=0 && fi>=0 && (unsigned)fi<strlen(wanims[dwi])) frame=wanims[dwi][fi];
-			Q_snprintfz(lump,sizeof(lump),"sprites/%sG%c0",wnames[dwi],frame);
+			if (dwi==wi && dw_off<=0 && fi>0 && (unsigned)(fi-1)<strlen(wanims[dwi])) frame=wanims[dwi][fi-1];
+
+			//Super Shotgun (SHT2) sprites omit the 'G' (SHT2A0 instead of SHT2GA0)
+			if (dwi == 4) Q_snprintfz(lump,sizeof(lump),"sprites/%s%c0",wnames[dwi],frame);
+			else Q_snprintfz(lump,sizeof(lump),"sprites/%sG%c0",wnames[dwi],frame);
+
 			wp=Doom_HudPic(lump);
 			if (wp && wp->sh)
+			{
+				//Draw muzzle flash on the first frame of firing
+				if (dwi==wi && dw_off<=0 && fi==1)
+				{
+					char flump[24];
+					Q_snprintfz(flump,sizeof(flump),"sprites/%sFA0",wnames[dwi]);
+					Doom_HudDraw(flump, 160, 168, scale, xoff);
+				}
+
 				//Doom weapon sprites use psprite offsets authored so that V_DrawPatch at virtual (0,0)
 				//centres them and rests the bottom on the 168-line (status-bar top). doom_weaponscale
 				//shrinks the weapon about that bottom-centre anchor (160,168) so it isn't oversized.
 				//dw_off slides it down for the raise/lower switch animation.
 				R2D_Image(xoff + (160 + (-wp->xo-160)*f)*scale, (168 - wp->h*f + dw_off)*scale,
 				          wp->w*f*scale, wp->h*f*scale, 0,0,1,1, wp->sh);
+			}
 		}
 		#undef DW_DOWN
 		#undef DW_SPEED
@@ -3971,6 +3986,7 @@ void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, floa
 {
 	doommap_t *dm = model?model->meshinfo:NULL;
 	unsigned int s;
+	qboolean qmode = Cvar_Get("doom_quakeweapons", "0", 0, "Doom")->ival != 0;
 	if (!dm)
 		return;
 	for (s = 0; s < dm->numsprites; )
@@ -3991,31 +4007,31 @@ void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, floa
 			case 83:   if (health) *health=200; if (armor) *armor=200; break;	//megasphere
 			//armor
 			case 2015: if (armor && *armor < 200) *armor += 1; break;	//armor bonus
-			case 2018: if (armor && *armor < 100) *armor = 100; break;	//green armor
-			case 2019: if (armor) *armor = 200; break;	//blue armor
+			case 2018: if (armor && *armor < 100) *armor = (qmode?100:100); break;	//green armor (Quake: 100)
+			case 2019: if (armor) *armor = 200; break;	//blue armor (Quake: 200)
 			//ammo (caps: bullets 200, shells 50, rockets 50, cells 300)
-			case 2007: if (bullets) *bullets = min(200,*bullets+10); break;	//clip
+			case 2007: if (bullets) *bullets = min(200,*bullets+(qmode?25:10)); break;	//clip (Quake: 25 nails)
 			case 2048: if (bullets) *bullets = min(200,*bullets+50); break;	//box of bullets
-			case 2008: if (shells)  *shells  = min(50, *shells +4);  break;	//4 shells
-			case 2049: if (shells)  *shells  = min(50, *shells +20); break;	//box of shells
-			case 2010: if (rockets) *rockets = min(50, *rockets+1);  break;	//rocket
-			case 2046: if (rockets) *rockets = min(50, *rockets+5);  break;	//box of rockets
-			case 2047: if (cells)   *cells   = min(300,*cells+20);   break;	//cell
-			case 17:   if (cells)   *cells   = min(300,*cells+100);  break;	//cell pack
+			case 2008: if (shells)  *shells  = min(50, *shells +(qmode?20:4));  break;	//shells (Quake: 20)
+			case 2049: if (shells)  *shells  = min(50, *shells +(qmode?40:20)); break; //box of shells (Quake: 40)
+			case 2010: if (rockets) *rockets = min(50, *rockets+(qmode?5:1));  break;	//rocket (Quake: 5)
+			case 2046: if (rockets) *rockets = min(50, *rockets+10);  break;	//box of rockets (Quake: 10)
+			case 2047: if (cells)   *cells   = min(300,*cells+(qmode?15:20));   break;	//cell (Quake: 15)
+			case 17:   if (cells)   *cells   = min(300,*cells+40);  break;	//cell pack (Quake: 40)
 			case 8:	//backpack
-				if (bullets) *bullets = min(200,*bullets+10);
-				if (shells)  *shells  = min(50, *shells +4);
-				if (rockets) *rockets = min(50, *rockets+1);
-				if (cells)   *cells   = min(300,*cells+20);
+				if (bullets) *bullets = min(200,*bullets+25);
+				if (shells)  *shells  = min(50, *shells +20);
+				if (rockets) *rockets = min(50, *rockets+5);
+				if (cells)   *cells   = min(300,*cells+15);
 				break;
 			//weapons (ownership + Doom's bundled ammo)
-			case 2001: wb |= DWEP_SHOTGUN;  if (shells)  *shells  = min(50,*shells+8);   nw=DW_SHOTGUN; break;
-			case 82:   wb |= DWEP_SSG;      if (shells)  *shells  = min(50,*shells+8);   nw=DW_SSG;     break;
-			case 2002: wb |= DWEP_CHAINGUN; if (bullets) *bullets = min(200,*bullets+20);nw=DW_CHAINGUN;break;
+			case 2001: wb |= DWEP_SHOTGUN;  if (shells)  *shells  = min(50,*shells+(qmode?25:8));   nw=DW_SHOTGUN; break; //SG (Quake: 25)
+			case 82:   wb |= DWEP_SSG;      if (shells)  *shells  = min(50,*shells+(qmode?25:8));   nw=DW_SSG;     break; //SSG (Quake: 25)
+			case 2002: wb |= DWEP_CHAINGUN; if (bullets) *bullets = min(200,*bullets+(qmode?25:20));nw=DW_CHAINGUN;break; //NG (Quake: 25)
 			case 2005: wb |= DWEP_CHAINSAW; nw=DW_CHAINSAW; break;
-			case 2003: wb |= DWEP_ROCKET;   if (rockets) *rockets = min(50,*rockets+2);  nw=DW_ROCKET;  break;
-			case 2004: wb |= DWEP_PLASMA;   if (cells)   *cells   = min(300,*cells+40);  nw=DW_PLASMA;  break;
-			case 2006: wb |= DWEP_BFG;      if (cells)   *cells   = min(300,*cells+40);  nw=DW_BFG;     break;
+			case 2003: wb |= DWEP_ROCKET;   if (rockets) *rockets = min(50,*rockets+(qmode?5:2));  nw=DW_ROCKET;  break; //RL (Quake: 5)
+			case 2004: wb |= DWEP_PLASMA;   if (cells)   *cells   = min(300,*cells+(qmode?15:40));  nw=DW_PLASMA;  break; //SNG/LG (Quake: 15)
+			case 2006: wb |= DWEP_BFG;      if (cells)   *cells   = min(300,*cells+(qmode?15:40));  nw=DW_BFG;     break; //LG (Quake: 15)
 			//keys (stored in the items mask for the HUD)
 			case 5:  wb |= DKEY_BCARD;  break;	case 40: wb |= DKEY_BSKULL; break;
 			case 6:  wb |= DKEY_YCARD;  break;	case 39: wb |= DKEY_YSKULL; break;
@@ -4028,10 +4044,30 @@ void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, floa
 				*items = (float)wb;
 				//auto-switch to better weapon
 				if (wb != old && weapon && nw != -1) {
-					//Ranking: BFG > Plasma > Rocket > Chaingun > SSG > Shotgun > Chainsaw > Pistol > Fist
-					int rank_val[] = {0, 2, 1, 3, 4, 5, 6, 7, 8};
-					if (nw >= 0 && nw < 9 && (*weapon < 0 || *weapon >= 9 || rank_val[nw] > rank_val[(int)*weapon]))
-						*weapon = (float)nw;
+					if (qmode)
+					{	//Quake ranking: RL > SSG > SNG > GL > NG > SG > AXE
+						int qrank[] = {0, 0, 1, 2, 6, 3, 7, 5, 4}; //DW_ indices: FIST:0 SAW:1 PISTOL:2 SHT:3 SSG:4 CHG:5 MIS:6 PL:7 BFG:8
+						//Wait, DW_ indices mapping to Quake:
+						//DW_FIST(0) -> Axe (0)
+						//DW_SHOTGUN(3) -> SG (2)
+						//DW_SSG(4) -> SSG (6)
+						//DW_CHAINGUN(5) -> NG (3)
+						//DW_PLASMA(7) -> SNG (5)
+						//DW_ROCKET(6) -> RL (7)
+						//DW_BFG(8) -> LG (4) -- actually LG is usually 8 in ranking? 
+						//Quake rank: 8:LG 7:RL 6:SSG 5:SNG 4:GL 3:NG 2:SG 1:AXE
+						int r_axe=1, r_sg=2, r_ng=3, r_gl=4, r_sng=5, r_ssg=6, r_rl=7, r_lg=8;
+						int r[] = {r_axe, r_axe, r_sg, r_sg, r_ssg, r_ng, r_rl, r_sng, r_lg};
+						if (nw >= 0 && nw < 9 && (*weapon < 0 || *weapon >= 9 || r[nw] > r[(int)*weapon]))
+							*weapon = (float)nw;
+					}
+					else
+					{
+						//Ranking: BFG > Plasma > Rocket > Chaingun > SSG > Shotgun > Chainsaw > Pistol > Fist
+						int rank_val[] = {0, 2, 1, 3, 4, 5, 6, 7, 8};
+						if (nw >= 0 && nw < 9 && (*weapon < 0 || *weapon >= 9 || rank_val[nw] > rank_val[(int)*weapon]))
+							*weapon = (float)nw;
+					}
 				}
 			}
 			{	//pickup sound: weapons use DSWPNUP, everything else DSITEMUP
@@ -4731,12 +4767,10 @@ static int Doom_ModelSlotIdx(const char *t)
 	if (!strcmp(t,"gib"))  return 2;
 	return -1;
 }
-static void Doom_LoadModelDef(void)
-{	//parse doommodels.def (generated from xmodels.pk3) into the model cache
+static void Doom_ParseModelDef(const char *fname)
+{	//parse a model def (doommodels.def from xmodels.pk3, or doommodels_dhmp.def) into the cache
 	char *file, *data; size_t sz=0; doommodel_t *cur=NULL;
-	if (doommodelsloaded) return;
-	doommodelsloaded=true;
-	file=FS_LoadMallocFile("doommodels.def",&sz);
+	file=FS_LoadMallocFile(fname,&sz);
 	if (!file) return;
 	data=file;
 	for (;;)
@@ -4771,6 +4805,15 @@ static void Doom_LoadModelDef(void)
 		//unknown token: ignore (file is generated, so this shouldn't happen)
 	}
 	BZ_Free(file);
+}
+static void Doom_LoadModelDef(void)
+{	//load the model defs once. When doom_hd is set, the DHMP HD models (doommodels_dhmp.def) are
+	//parsed FIRST so they win in Doom_GetModel's first-match lookup; xmodels.pk3 covers the rest.
+	if (doommodelsloaded) return;
+	doommodelsloaded=true;
+	if ((int)Cvar_Get("doom_hd","0",CVAR_ARCHIVE,"Doom")->value)
+		Doom_ParseModelDef("doommodels_dhmp.def");
+	Doom_ParseModelDef("doommodels.def");
 }
 static doommodel_t *Doom_GetModel(const char *spr)
 {
@@ -4835,16 +4878,17 @@ static const char *doomvmdir[9] =
 static struct doomvm_s { qboolean tried; model_t *view, *flash; shader_t *vsh, *fsh; } doomvm[9];
 static float doomvm_off;	//shared raise/lower fraction (0=up .. 1=hidden)
 
-static shader_t *Doom_VMSkinShader(model_t *mod, const char *prefix)
-{	//shader for an MD2's embedded skin (opaque, double-sided, fullbright vertex colour). The
-	//on-top / additive behaviour is applied per-draw via BEF_ flags, so it's not baked in here.
+static shader_t *Doom_VMSkinShader(model_t *mod, const char *prefix, qboolean backcull)
+{	//shader for an MD2's embedded skin (fullbright vertex colour). backcull=true culls back faces so
+	//the gun looks solid when drawn no-depth (otherwise the inner/back faces show through = "inside
+	//out"); the additive muzzle flash stays double-sided. on-top/additive is set per-draw via BEF_.
 	galiasinfo_t *inf = mod?Mod_Extradata(mod):NULL;
 	const char *skin = (inf && inf->numskins>0 && inf->ofsskins && inf->ofsskins[0].numframes>0 && inf->ofsskins[0].frame)
 	                 ? inf->ofsskins[0].frame[0].shadername : NULL;
 	char body[320], shname[96];
 	if (!skin || !skin[0]) return NULL;
 	Q_snprintfz(shname,sizeof(shname),"%s/%s",prefix,skin);
-	Q_snprintfz(body,sizeof(body),"{\ncull none\n{\nmap \"%s\"\nrgbgen vertex\n}\n}\n",skin);
+	Q_snprintfz(body,sizeof(body),"{\n%s{\nmap \"%s\"\nrgbgen vertex\n}\n}\n", backcull?"":"cull none\n", skin);
 	return R_RegisterShader(shname,SUF_NONE,body);
 }
 void Doom_LoadViewWeapon(int wi)
@@ -4855,11 +4899,11 @@ void Doom_LoadViewWeapon(int wi)
 	Q_snprintfz(path,sizeof(path),"models/weapons/%s/view.md2",doomvmdir[wi]);
 	m = Mod_ForName(path, MLV_WARNSYNC);
 	if (m && m->type==mod_alias && m->loadstate==MLS_LOADED)
-		{ doomvm[wi].view=m; doomvm[wi].vsh=Doom_VMSkinShader(m,"doom_vm"); }
+		{ doomvm[wi].view=m; doomvm[wi].vsh=Doom_VMSkinShader(m,"doom_vm",true); }	//cull back faces -> solid
 	Q_snprintfz(path,sizeof(path),"models/weapons/%s/flash.md2",doomvmdir[wi]);
 	m = Mod_ForName(path, MLV_SILENTSYNC);	//fists/chainsaw have no flash - silent if missing
 	if (m && m->type==mod_alias && m->loadstate==MLS_LOADED)
-		{ doomvm[wi].flash=m; doomvm[wi].fsh=Doom_VMSkinShader(m,"doom_vmflash"); }
+		{ doomvm[wi].flash=m; doomvm[wi].fsh=Doom_VMSkinShader(m,"doom_vmflash",false); }	//flash: double-sided
 }
 qboolean Doom_ViewModelActive(int wi)
 {	//true if a 3D viewmodel will draw for this weapon (so the 2D HUD weapon can stand down)
@@ -4919,8 +4963,8 @@ void Doom_DrawViewModel(void)
 	if (!mod || !sh) return;
 	inf=Mod_Extradata(mod); if (!inf) return;
 
-	scale     = Cvar_Get("doom_vm_scale","1.4",CVAR_ARCHIVE,"Doom")->value;	//overall size multiplier (after per-model normalisation)
-	ofwd      = Cvar_Get("doom_vm_fwd","10",CVAR_ARCHIVE,"Doom")->value;	//forward from the eye
+	scale     = Cvar_Get("doom_vm_scale","1.3",CVAR_ARCHIVE,"Doom")->value;	//overall size multiplier (after per-model normalisation)
+	ofwd      = Cvar_Get("doom_vm_fwd","4",CVAR_ARCHIVE,"Doom")->value;	//forward from the eye (closer = bigger/nearer)
 	oright    = Cvar_Get("doom_vm_right","3",CVAR_ARCHIVE,"Doom")->value;	//+ = to the right
 	oup       = Cvar_Get("doom_vm_up","-10",CVAR_ARCHIVE,"Doom")->value;	//- = position of the weapon's TOP below the eye
 	lowerdist = Cvar_Get("doom_vm_lower","40",CVAR_ARCHIVE,"Doom")->value;	//switch drop distance
@@ -4942,7 +4986,7 @@ void Doom_DrawViewModel(void)
 			{ float v=p->ofsverts[i][k]; if(v<mn[k])mn[k]=v; if(v>mx[k])mx[k]=v; }
 			sizeref = (mx[1]-mn[1] > mx[2]-mn[2]) ? (mx[1]-mn[1]) : (mx[2]-mn[2]);	//screen-plane extent
 			if (sizeref < 1) sizeref = 1;
-			eff = scale * (22.0f / sizeref);	//normalise: target ~22 units on the screen plane
+			eff = scale * (30.0f / sizeref);	//normalise: target ~30 units on the screen plane
 			cy  = (mn[1]+mx[1])*0.5f;	//horizontal centroid only
 		}
 		AngleVectors(r_refdef.viewangles, fwd, right, up);
@@ -4953,15 +4997,17 @@ void Doom_DrawViewModel(void)
 		if (p) VectorMA(base, -eff*mx[2], up, base);	//anchor the weapon's TOP at oup, so scaling grows it
 							//in place (arm extends further off-bottom) instead of sliding it down
 		if (p) { float nearfwd = ofwd + mn[0]*eff;	//keep the nearest point off the near clip plane
-		         if (nearfwd < 8.0f) VectorMA(base, 8.0f-nearfwd, fwd, base); }
+		         if (nearfwd < 4.0f) VectorMA(base, 4.0f-nearfwd, fwd, base); }
 		scale = eff;	//draw with the normalised scale (also used for the flash, kept aligned)
 	}
 
-	//draw on top of the world (BEF_FORCENODEPTH) so it never vanishes behind the floor when you look
-	//down, nor clips into nearby geometry - exactly like the 2D HUD weapon sprite it replaces.
+	//Draw NO-DEPTH so it's always on top of the world - never vanishing behind the floor when you
+	//look down, nor clipping into nearby walls (just like the 2D HUD weapon it replaces). The solid
+	//look is kept by back-face culling in the shader (doom_vm), so the inner/back faces don't show
+	//through - that's what fixes the "inside-out / striped" mess no-depth caused with cull none.
 	Doom_DrawVMMesh(mod, sh, frame, base, fwd, right, up, scale, BEF_FORCENODEPTH);
 
-	//muzzle flash (additive) on fire frames, only when fully raised
+	//muzzle flash (additive, double-sided) on fire frames, only when fully raised
 	if (doomvm[wi].flash && doomvm[wi].fsh && doomvm_off<=0 && fi>0)
 	{
 		galiasinfo_t *fin = Mod_Extradata(doomvm[wi].flash);
@@ -4969,11 +5015,55 @@ void Doom_DrawViewModel(void)
 		Doom_DrawVMMesh(doomvm[wi].flash, doomvm[wi].fsh, ff, base, fwd, right, up, scale, BEF_FORCENODEPTH|BEF_FORCEADDITIVE);
 	}
 }
+//Resolve an IQM/glTF surface material name (e.g. "barrel_lp", "obj_bubbles2") to a high-res diffuse
+//texture under models_dhmp/ (the converted DHMP HD models). Tries a few name cleanups since the
+//material names don't match the texture filenames 1:1. Returns the path (incl. .png) in 'out'.
+static qboolean Doom_HDTexture(const char *mat, char *out, size_t outsz)
+{
+	char b[64], c[4][64]; int i, n;
+	if (!mat || !mat[0]) return false;
+	Q_strncpyz(b, mat, sizeof(b));
+	if (!Q_strncmp(b,"obj_",4)) memmove(b, b+4, strlen(b+4)+1);	//strip the "obj_" prefix
+	Q_strncpyz(c[0], b, 64);					//as-is
+	Q_strncpyz(c[1], b, 64); n=(int)strlen(c[1]);			//strip trailing digits, then a plural 's'
+	while (n>0 && c[1][n-1]>='0' && c[1][n-1]<='9') c[1][--n]=0;
+	if (n>1 && c[1][n-1]=='s') c[1][--n]=0;
+	Q_strncpyz(c[2], b, 64); n=(int)strlen(c[2]);			//strip a "_lp" (low-poly) suffix
+	if (n>3 && !Q_strcmp(c[2]+n-3,"_lp")) c[2][n-3]=0;
+	Q_strncpyz(c[3], c[2], 64); n=(int)strlen(c[3]);		//strip _lp, then digits + 's'
+	while (n>0 && c[3][n-1]>='0' && c[3][n-1]<='9') c[3][--n]=0;
+	if (n>1 && c[3][n-1]=='s') c[3][--n]=0;
+	for (i=0;i<4;i++)
+	{
+		if (!c[i][0]) continue;
+		Q_snprintfz(out, outsz, "models_dhmp/%s.png", c[i]);
+		if (COM_FCheckExists(out)) return true;
+	}
+	return false;
+}
+//Shader for one model surface: an HD diffuse texture if the material resolves under models_dhmp/,
+//else the fallback (the model's embedded skin shader - the normal MD2 case). Flat/fullbright for now.
+static shader_t *Doom_SurfaceShader(galiasinfo_t *surf, shader_t *fallback)
+{
+	const char *mat = (surf->numskins>0 && surf->ofsskins && surf->ofsskins[0].numframes>0 && surf->ofsskins[0].frame)
+	                  ? surf->ofsskins[0].frame[0].shadername : surf->surfacename;
+	char tex[96], shname[160], body[256];
+	if (mat && mat[0] && Doom_HDTexture(mat, tex, sizeof(tex)))
+	{
+		Q_snprintfz(shname,sizeof(shname),"doom_hd/%s",mat);
+		Q_snprintfz(body,sizeof(body),"{\ncull none\n{\nmap \"%s\"\nrgbgen vertex\n}\n}\n",tex);
+		return R_RegisterShader(shname,SUF_NONE,body);
+	}
+	return fallback;
+}
 static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
-{	//render the monster's MD2 for the given phase/frame; false -> caller falls back to voxel/sprite
+{	//render a thing's model for the given phase/frame; false -> caller falls back to voxel/sprite.
+	//Iterates ALL surfaces (MD2s have one; the DHMP IQM/glTF models are multi-surface), each with
+	//its own skin shader - so a barrel draws its body + nukage + bubbles, not just the first mesh.
 	doommodel_t *dm=Doom_GetModel(spr);
-	galiasinfo_t *inf; galiaspose_t *pose; model_t *mod=NULL; shader_t *sh=NULL;
+	galiasinfo_t *inf, *surf; model_t *mod=NULL; shader_t *sh=NULL;
 	int slot, listlen, li, frame, i, nv; mesh_t mesh; float c,s,a;
+	qboolean drewany=false;
 	if (!dm || phase<0 || phase>=DMDL_NUMPH) return false;
 	listlen=dm->phcount[phase]; if (listlen<=0) return false;
 	slot=dm->phslot[phase];
@@ -4989,31 +5079,41 @@ static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, c
 		if (li<0) li=0; if (li>=listlen) li=listlen-1;
 	}
 	frame=dm->phframe[phase][li];
-	if (frame<0 || frame>=inf->numanimations) return false;
-	if (!inf->ofsanimations[frame].numposes) return false;
-	pose=&inf->ofsanimations[frame].poseofs[0];
-	nv=inf->numverts;
-	if (nv>doommdlcap)
-	{
-		doommdlcap=nv+256;
-		doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
-		doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
-		memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
-	}
 	a=yawdeg*(M_PI/180.0); c=cos(a); s=sin(a);
-	for (i=0;i<nv;i++)
-	{	//MD2 model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to feet
-		float lx=pose->ofsverts[i][0]*scale, ly=pose->ofsverts[i][1]*scale, lz=pose->ofsverts[i][2]*scale;
-		doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
-		doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
-		doommdlxyz[i][2]=origin[2]+lz;
+	for (surf=inf; surf; surf=surf->nextsurf)
+	{
+		galiaspose_t *pose; shader_t *ssh; int f2=frame; const char *snm=surf->surfacename;
+		if (surf->numverts<=0 || surf->numanimations<=0) continue;
+		//skip the "death"/exploded sub-meshes on a live thing (the DHMP barrel packs both in one model)
+		if (snm && (strstr(snm,"death") || strstr(snm,"_dead"))) continue;
+		if (f2<0 || f2>=surf->numanimations) f2=0;	//clamp the frame per-surface
+		if (!surf->ofsanimations[f2].numposes) continue;
+		pose=&surf->ofsanimations[f2].poseofs[0];
+		ssh=Doom_SurfaceShader(surf, sh);
+		if (!ssh) continue;
+		nv=surf->numverts;
+		if (nv>doommdlcap)
+		{
+			doommdlcap=nv+256;
+			doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
+			doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
+			memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
+		}
+		for (i=0;i<nv;i++)
+		{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet
+			float lx=pose->ofsverts[i][0]*scale, ly=pose->ofsverts[i][1]*scale, lz=pose->ofsverts[i][2]*scale;
+			doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
+			doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
+			doommdlxyz[i][2]=origin[2]+lz;
+		}
+		memset(&mesh,0,sizeof(mesh));
+		mesh.numvertexes=nv; mesh.numindexes=surf->numindexes;
+		mesh.xyz_array=doommdlxyz; mesh.st_array=surf->ofs_st_array;
+		mesh.colors4b_array=doommdlcol; mesh.indexes=surf->ofs_indexes;
+		BE_DrawMesh_Single(ssh,&mesh,NULL,0);
+		drewany=true;
 	}
-	memset(&mesh,0,sizeof(mesh));
-	mesh.numvertexes=nv; mesh.numindexes=inf->numindexes;
-	mesh.xyz_array=doommdlxyz; mesh.st_array=inf->ofs_st_array;
-	mesh.colors4b_array=doommdlcol; mesh.indexes=inf->ofs_indexes;
-	BE_DrawMesh_Single(sh,&mesh,NULL,0);
-	return true;
+	return drewany;
 }
 
 //draw monsters as upright camera-facing billboards (same technique as R_DoomDrawSprites).
