@@ -5062,15 +5062,12 @@ static shader_t *Doom_SurfaceShader(galiasinfo_t *surf, shader_t *fallback)
 	}
 	return fallback;
 }
-static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
-{	//render a thing's model for the given phase/frame; false -> caller falls back to voxel/sprite.
-	//Iterates ALL surfaces (MD2s have one; the DHMP IQM/glTF models are multi-surface), each with
-	//its own skin shader - so a barrel draws its body + nukage + bubbles, not just the first mesh.
-	doommodel_t *dm=Doom_GetModel(spr);
+static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
+{	//render ONE model def entry for the given phase/frame. Iterates ALL surfaces (MD2s have one; the
+	//DHMP IQM/glTF models are multi-surface), each with its own skin shader. false -> nothing drawn.
 	galiasinfo_t *inf, *surf; model_t *mod=NULL; shader_t *sh=NULL;
 	int slot, listlen, li, frame, i, nv; mesh_t mesh; float c,s,a;
 	qboolean drewany=false;
-	if (!dm || phase<0 || phase>=DMDL_NUMPH) return false;
 	listlen=dm->phcount[phase]; if (listlen<=0) return false;
 	slot=dm->phslot[phase];
 	if (!Doom_ModelSlot(dm,slot,&mod,&sh)) return false;
@@ -5132,6 +5129,20 @@ static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, c
 		drewany=true;
 	}
 	return drewany;
+}
+static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
+{	//Try EVERY model def for this sprite (HD/DHMP entry first, then xmodels MD2). An entry that can't
+	//render - e.g. a skeletal DHMP IQM this simple path can't skin - draws nothing and we fall
+	//through to the next def, so things don't drop to a sprite just because an HD model exists but
+	//isn't drawable. false -> no def could draw it (caller then falls back to voxel/sprite).
+	int mi;
+	if (phase<0 || phase>=DMDL_NUMPH) return false;
+	Doom_LoadModelDef();
+	for (mi=0; mi<doommodelcount; mi++)
+		if (!strcmp(doommodels[mi].spr, spr) &&
+		    Doom_DrawModelEntry(&doommodels[mi], phase, idx, count, origin, yawdeg, scale))
+			return true;
+	return false;
 }
 
 //draw monsters as upright camera-facing billboards (same technique as R_DoomDrawSprites).
