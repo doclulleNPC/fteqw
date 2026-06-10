@@ -5066,12 +5066,16 @@ static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int cou
 {	//render ONE model def entry for the given phase/frame. Iterates ALL surfaces (MD2s have one; the
 	//DHMP IQM/glTF models are multi-surface), each with its own skin shader. false -> nothing drawn.
 	galiasinfo_t *inf, *surf; model_t *mod=NULL; shader_t *sh=NULL;
-	int slot, listlen, li, frame, i, nv; mesh_t mesh; float c,s,a;
-	qboolean drewany=false;
+	int slot, listlen, li, frame, i, nv, surfnum; mesh_t mesh; float c,s,a, hdscale;
+	qboolean drewany=false, usedskel=false;
+	entity_t re;
 	listlen=dm->phcount[phase]; if (listlen<=0) return false;
 	slot=dm->phslot[phase];
 	if (!Doom_ModelSlot(dm,slot,&mod,&sh)) return false;
-	inf=Mod_Extradata(mod); if (!inf || inf->numanimations<=0 || inf->numverts<=0) return false;
+	inf=Mod_Extradata(mod); if (!inf || inf->numverts<=0) return false;	//(skeletal models may have 0 baked anims)
+	//rest-pose entity used to CPU-skin skeletal (IQM) surfaces via the engine (Alias_GAliasBuildMesh).
+	memset(&re,0,sizeof(re)); re.model=mod; re.framestate.g[FS_REG].lerpweight[0]=1;
+	hdscale=Cvar_Get("doom_hdscale","1",CVAR_ARCHIVE,"Doom")->value;	//extra scale for HD/skeletal models
 	if (count==0)
 		li = ((idx%listlen)+listlen)%listlen;	//wrap: step idx through the list looping (idle/spin decorations)
 	else if (count<0)
@@ -5083,51 +5087,60 @@ static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int cou
 	}
 	frame=dm->phframe[phase][li];
 	a=yawdeg*(M_PI/180.0); c=cos(a); s=sin(a);
-	for (surf=inf; surf; surf=surf->nextsurf)
+	for (surf=inf, surfnum=0; surf; surf=surf->nextsurf, surfnum++)
 	{
-		galiaspose_t *pose; shader_t *ssh; int f2=frame; const char *snm=surf->surfacename;
-		if (surf->numverts<=0 || surf->numanimations<=0) continue;
+		shader_t *ssh; int f2=frame; const char *snm=surf->surfacename;
+		vecV_t *vsrc; qboolean skel=false; float es;
+		if (surf->numverts<=0) continue;
 		//Skip "death"/exploded sub-meshes only on a LIVE phase - the DHMP barrel packs its intact and
 		//exploded geometry in one model, so a standing barrel must not show the wreckage. But a
 		//separate MD2 death model (trooper/death.md2) has a surface called "death" that we MUST draw
 		//for the die phase, so only hide death surfaces when not actually dying/gibbing.
 		if (phase!=DMDL_DIE && phase!=DMDL_GIB && snm && (strstr(snm,"death") || strstr(snm,"_dead"))) continue;
-		if (f2<0 || f2>=surf->numanimations) f2=0;	//clamp the frame per-surface
-		//Vertex source: MD2s store baked per-frame verts in poseofs[].ofsverts. Skeletal models (the
-		//DHMP IQMs) store NO baked verts - their geometry needs bone-skinning, which this simple path
-		//doesn't do; their raw bind verts are at arbitrary scale/layout (the joints carry the real
-		//transform), so we can't draw them here. Reading ofsverts on a skeletal model would also
-		//dereference NULL -> crash. So use the baked pose verts and SKIP any surface without them
-		//(skeletal/IQM) - the caller then falls back (per the no-mix rule, to the sprite).
-		pose = (surf->ofsanimations[f2].numposes>0) ? &surf->ofsanimations[f2].poseofs[0] : NULL;
+		if (surf->numanimations>0) { if (f2<0 || f2>=surf->numanimations) f2=0; } else f2=0;
+		memset(&mesh,0,sizeof(mesh));
+		//Vertex source. MD2s store baked per-frame verts in poseofs[].ofsverts - use them directly.
+		//Skeletal models (the DHMP IQMs) have none; the engine CPU-skins them from bones, which bakes
+		//the joint scale and produces the model at its authored size. Build that into the mesh.
 		{
-			vecV_t *vsrc = (pose && pose->ofsverts) ? pose->ofsverts : NULL;
-			if (!vsrc || !surf->ofs_st_array || !surf->ofs_indexes) continue;
-			ssh=Doom_SurfaceShader(surf, sh);
-			if (!ssh) continue;
-			nv=surf->numverts;
-			if (nv>doommdlcap)
-			{
-				doommdlcap=nv+256;
-				doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
-				doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
-				memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
+			galiaspose_t *pose = (surf->numanimations>0 && surf->ofsanimations[f2].numposes>0)
+			                     ? &surf->ofsanimations[f2].poseofs[0] : NULL;
+			if (pose && pose->ofsverts)
+			{	//MD2 / baked
+				vsrc = pose->ofsverts; nv = surf->numverts;
+				mesh.numindexes = surf->numindexes; mesh.st_array = surf->ofs_st_array; mesh.indexes = surf->ofs_indexes;
 			}
-			for (i=0;i<nv;i++)
-			{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet
-				float lx=vsrc[i][0]*scale, ly=vsrc[i][1]*scale, lz=vsrc[i][2]*scale;
-				doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
-				doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
-				doommdlxyz[i][2]=origin[2]+lz;
+			else
+			{	//skeletal IQM: CPU bone-skin this surface in its rest/def pose (model space out)
+				re.framestate.g[FS_REG].frame[0] = f2;
+				Alias_GAliasBuildMesh(&mesh, NULL, surf, surfnum, &re, false);
+				skel = true; usedskel = true;
+				vsrc = mesh.xyz_array; nv = mesh.numvertexes;
 			}
 		}
-		memset(&mesh,0,sizeof(mesh));
-		mesh.numvertexes=nv; mesh.numindexes=surf->numindexes;
-		mesh.xyz_array=doommdlxyz; mesh.st_array=surf->ofs_st_array;
-		mesh.colors4b_array=doommdlcol; mesh.indexes=surf->ofs_indexes;
+		if (!vsrc || !mesh.st_array || !mesh.indexes || nv<=0) continue;
+		ssh=Doom_SurfaceShader(surf, sh);
+		if (!ssh) continue;
+		if (nv>doommdlcap)
+		{
+			doommdlcap=nv+256;
+			doommdlxyz=BZ_Realloc(doommdlxyz,doommdlcap*sizeof(vecV_t));
+			doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
+			memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
+		}
+		es = skel ? scale*hdscale : scale;
+		for (i=0;i<nv;i++)
+		{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet
+			float lx=vsrc[i][0]*es, ly=vsrc[i][1]*es, lz=vsrc[i][2]*es;
+			doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
+			doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
+			doommdlxyz[i][2]=origin[2]+lz;
+		}
+		mesh.numvertexes=nv; mesh.xyz_array=doommdlxyz; mesh.colors4b_array=doommdlcol;
 		BE_DrawMesh_Single(ssh,&mesh,NULL,0);
 		drewany=true;
 	}
+	if (usedskel) Alias_FlushCache();	//re was on the stack - clear the per-entity skin cache
 	return drewany;
 }
 static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
