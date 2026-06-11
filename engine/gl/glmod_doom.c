@@ -25,6 +25,21 @@ static void Doom_EmitFX(doommap_t *dm);	//drain dm->fx -> particle effects (clie
 #define DMDL_NUMPH  5
 void Doom_PlaySound(const vec3_t org, const char *lump);
 
+//Thing render mode: ONE selector for how Doom's things (enemies, items, pickups, decorations, the
+//held weapon) are drawn. OG 2D sprites are always the baseline; a mode swaps in models or voxels
+//for every thing that has a replacement. The three modes are mutually exclusive - this supersedes
+//the old independent doom_models/doom_voxels/doom_hd/doom_viewmodel toggles.
+#define DRM_SPRITE 0	//pure OG Doom: weapons, enemies, items, decorations all 2D sprites
+#define DRM_MD2    1	//sprites + xmodels.pk3 MD2 models (incl. the 3D first-person weapon)
+#define DRM_VOXEL  2	//sprites + VoxelDoom voxels
+static int Doom_RenderMode(void)
+{
+	int m = (int)Cvar_Get("doom_rendermode", "0", CVAR_ARCHIVE,
+		"Doom thing render mode: 0=OG sprites, 1=MD2 models, 2=voxels. Changing it takes effect on the next map load.")->value;
+	if (m < DRM_SPRITE || m > DRM_VOXEL) m = DRM_SPRITE;
+	return m;
+}
+
 
 
 char *va2(char *buffer, size_t buffersize, const char *format, ...)
@@ -1860,11 +1875,11 @@ static void R_DoomDrawSprites(doommap_t *dm)
 	int usevox, usemod, usehd, spin; float voxscale, voxyaw, modscale, decoryaw, modz, spinrate;
 	if (!dm->numsprites)
 		return;
-	usevox  = (int)Cvar_Get("doom_voxels", "0", CVAR_ARCHIVE, "Doom")->value;	//default OG sprites
+	usevox  = (Doom_RenderMode()==DRM_VOXEL);	//voxel mode -> VoxelDoom voxels
 	voxscale= Cvar_Get("doom_voxscale", "1", CVAR_ARCHIVE, "Doom")->value;
 	voxyaw  = Cvar_Get("doom_voxyaw", "90", CVAR_ARCHIVE, "Doom")->value;
-	usemod  = (int)Cvar_Get("doom_models", "0", CVAR_ARCHIVE, "Doom")->value;	//full xmodels MD2 set (off by default)
-	usehd   = (int)Cvar_Get("doom_hd", "1", CVAR_ARCHIVE, "Doom")->value;		//curated HD models (on by default)
+	usemod  = (Doom_RenderMode()==DRM_MD2);		//MD2 mode -> xmodels.pk3 models
+	usehd   = 0;					//HD path retired (see Doom_RenderMode); kept compiled, never selected
 	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;
 	//decorations have no AI facing, so they sit at a fixed world yaw. Their models are authored 90 CW
 	//of the monster convention (doom_modyaw 0), hence a separate offset - default -90 (90 CW).
@@ -4813,14 +4828,11 @@ static void Doom_ParseModelDef(const char *fname)
 	BZ_Free(file);
 }
 static void Doom_LoadModelDef(void)
-{	//Load the model defs once, per the mode cvars. Default is OG Doom sprites for everything; a
-	//curated set of HD (DHMP) models is layered on when doom_hd is set, and the full xmodels.pk3
-	//MD2 set only when doom_models is set. doom_hd is parsed first so it wins the first-match lookup.
+{	//Load the model def once. Only MD2 mode uses models (the full xmodels.pk3 set in doommodels.def);
+	//sprite and voxel modes load nothing here. The retired HD/DHMP def is intentionally not parsed.
 	if (doommodelsloaded) return;
 	doommodelsloaded=true;
-	if ((int)Cvar_Get("doom_hd","1",CVAR_ARCHIVE,"Doom")->value)		//curated HD models (on by default)
-		Doom_ParseModelDef("doommodels_dhmp.def");
-	if ((int)Cvar_Get("doom_models","0",CVAR_ARCHIVE,"Doom")->value)	//full xmodels MD2 set (off by default = sprites)
+	if (Doom_RenderMode()==DRM_MD2)
 		Doom_ParseModelDef("doommodels.def");
 }
 static doommodel_t *Doom_GetModel(const char *spr)
@@ -4866,17 +4878,15 @@ void Doom_PreloadModels(void)
 {	//load every MD2 def's slots up front (at map-load, main thread) so the synchronous loads
 	//never happen mid-render. Cheap (a handful of small models); skips any that fail to load.
 	int i, slot; model_t *m; shader_t *s;
-	if (!(int)Cvar_Get("doom_models","0",CVAR_ARCHIVE,"Doom")->value &&
-	    !(int)Cvar_Get("doom_hd","1",CVAR_ARCHIVE,"Doom")->value)
-		return;	//neither MD2 nor HD models enabled (pure sprites) - don't pay the load cost
+	if (Doom_RenderMode()!=DRM_MD2)
+		return;	//only MD2 mode uses models (sprite/voxel modes) - don't pay the load cost
 	Doom_LoadModelDef();
 	for (i=0;i<doommodelcount;i++)
 		for (slot=0;slot<3;slot++)
 			if (doommodels[i].mdl[slot][0])
 				Doom_ModelSlot(&doommodels[i], slot, &m, &s);
-	if ((int)Cvar_Get("doom_viewmodel","0", CVAR_ARCHIVE, "Doom")->value)
-		for (i=0;i<9;i++)
-			Doom_LoadViewWeapon(i);	//first-person weapon models, loaded up front (main thread)
+	for (i=0;i<9;i++)
+		Doom_LoadViewWeapon(i);	//MD2 mode: the held weapon is the 3D viewmodel too (preload, main thread)
 }
 
 //================= first-person weapon view models (xmodels.pk3) =================
@@ -4917,7 +4927,7 @@ void Doom_LoadViewWeapon(int wi)
 }
 qboolean Doom_ViewModelActive(int wi)
 {	//true if a 3D viewmodel will draw for this weapon (so the 2D HUD weapon can stand down)
-	if (!(int)Cvar_Get("doom_viewmodel","0",CVAR_ARCHIVE,"Doom")->value) return false;
+	if (Doom_RenderMode()!=DRM_MD2) return false;	//held weapon follows the mode (3D only in MD2 mode)
 	return wi>=0 && wi<9 && doomvm[wi].view && doomvm[wi].vsh;
 }
 static void Doom_DrawVMMesh(model_t *mod, shader_t *sh, int frame, const vec3_t base,
@@ -4954,7 +4964,7 @@ void Doom_DrawViewModel(void)
 	static int vm_shown=-1, vm_target=-1; static double vm_last=0;
 
 	if (!cl.worldmodel || cl.worldmodel->fromgame!=fg_doom || !pv) return;
-	if (!(int)Cvar_Get("doom_viewmodel","0",CVAR_ARCHIVE,"Doom")->value) return;
+	if (Doom_RenderMode()!=DRM_MD2) return;	//held weapon follows the mode (3D only in MD2 mode)
 	health = pv->stats[STAT_HEALTH];
 	wi = pv->stats[STAT_ACTIVEWEAPON]; if (wi<0||wi>=9) wi=2;
 	fi = pv->stats[STAT_WEAPONFRAME];
@@ -5215,11 +5225,11 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		return;
 	sprrot = (int)Cvar_Get("doom_sprrot", "1", CVAR_ARCHIVE, "Doom Sprites")->value;	//1=8-way+mirror, 0=front only
 	sprfreeze = (int)Cvar_Get("doom_sprfreeze", "-1", CVAR_ARCHIVE, "Doom Sprites")->value;	//>=0 holds that walk frame
-	usevox  = (int)Cvar_Get("doom_voxels", "0", CVAR_ARCHIVE, "Doom")->value;	//default OG sprites (0)
+	usevox  = (Doom_RenderMode()==DRM_VOXEL);	//voxel mode -> VoxelDoom voxels
 	voxscale= Cvar_Get("doom_voxscale", "1", CVAR_ARCHIVE, "Doom")->value;		//world units per voxel
 	voxyaw  = Cvar_Get("doom_voxyaw", "90", CVAR_ARCHIVE, "Doom")->value;		//facing offset (deg) for tuning
-	usemod  = (int)Cvar_Get("doom_models", "0", CVAR_ARCHIVE, "Doom")->value;	//full xmodels MD2 set (off by default)
-	usehd   = (int)Cvar_Get("doom_hd", "1", CVAR_ARCHIVE, "Doom")->value;		//curated HD models (on by default)
+	usemod  = (Doom_RenderMode()==DRM_MD2);		//MD2 mode -> xmodels.pk3 models
+	usehd   = 0;					//HD path retired (see Doom_RenderMode); kept compiled, never selected
 	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;		//MD2 scale (Vavoom models are ~1:1 with map units)
 	modyaw  = Cvar_Get("doom_modyaw", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 facing offset (deg); 0 after the +90 voxel default was rotated 90 CW to match these models
 	modz    = Cvar_Get("doom_modz", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 vertical offset (deg) for tuning
