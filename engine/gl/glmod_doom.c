@@ -5316,12 +5316,17 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		//MD2 def at all it's an "MD2 thing": render MD2, and if a phase's MD2 is missing fall back to
 		//the SPRITE, not the voxel. Only monsters with no MD2 def use voxels.
 		qboolean hasmodel = (usemod||usehd) && Doom_HasModel(m->spr);
-		if ((usemod||usehd) && mph>=0)
+		//A dying barrel ALWAYS plays the BEXP fireball SPRITE, never a model: the alive barrel is the
+		//HD/MD2 model, but its explosion is the classic 5-frame sprite blast. Skipping the model draw
+		//here (for the DIE phase only) makes that hold no matter which defs are loaded - otherwise the
+		//MD2 def's "die -> barrelx1.md2" entry would swallow the death and the sprite blast never shows.
+		qboolean barrelblast = (m->atk & MATK_BARREL) && mph==DMDL_DIE;
+		if ((usemod||usehd) && mph>=0 && !barrelblast)
 		{	//HD/MD2 model for this monster+phase (HD takes priority where a def exists)
 			vec3_t mo; VectorCopy(m->origin, mo); mo[2]+=modz;
 			if (Doom_DrawModel(m->spr, mph, midx, mcount, mo, m->yaw+modyaw, modscale, (float)shh)) continue;
 		}
-		if (!hasmodel && usevox && vlet && vbase)
+		if (!barrelblast && !hasmodel && usevox && vlet && vbase)
 		{	//voxel model for this frame (only when there's no MD2 def, so we never mix the two)
 			char vn[16];
 			Q_snprintfz(vn,sizeof(vn),"%s%c",vbase,vlet);
