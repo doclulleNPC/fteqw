@@ -2530,7 +2530,19 @@ static texid_t Doom_LoadPatchFromTexWad(char *name, void *texlump, unsigned shor
 				}
 			}
 
-			result = R_LoadTexture32(name, tx->width, tx->height, tex, 0);
+			//hi-res replacement (DHTP): with doom_hires on, look for an external image named after this
+			//texture in the DHTP layout - filter/doom/hires/<name>.png - exactly like gzdoom's "hires"
+			//namespace (FTextureManager::AddHiresTextures). The composited WAD pixels are the fallback,
+			//and the logical width/height stay the WAD's, so the UV math (s/tex->width) maps the sharper
+			//image across the SAME tiling - the gzdoom SetDisplaySize(origW,origH) trick, no distortion.
+			if (Cvar_Get("doom_hires","0",CVAR_ARCHIVE,"Doom")->value)
+			{
+				char lc[16]; size_t n=strnlen(name,8);
+				memcpy(lc,name,n); lc[n]=0; Q_strlwr(lc);
+				result = R_LoadReplacementTexture(lc, "filter/doom/hires", 0, tex, tx->width, tx->height, TF_RGBA32);
+			}
+			else
+				result = R_LoadTexture32(name, tx->width, tx->height, tex, 0);
 			BZ_Free(tex);
 			return result;
 		}
@@ -5409,7 +5421,13 @@ static shader_t *Doom_BuildFlatShader(const char *lump)
 	Q_snprintfz(path, sizeof(path), "flats/%s.raw", lump);		//...but the raw 64x64 data is loaded from .raw
 	file = FS_LoadMallocFile(path, NULL);
 	if (!file) return NULL;
-	tn.base = Image_GetTexture(name, NULL, 0, file, doompalette, 64, 64, TF_8PAL24);	//name w/o .raw: else "format unsupported"
+	if (Cvar_Get("doom_hires","0",CVAR_ARCHIVE,"Doom")->value)
+	{	//hi-res anim frame too, so the whole liquid cycle stays sharp (not just the base frame)
+		char lc[16]; Q_strncpyz(lc, lump, sizeof(lc)); Q_strlwr(lc);
+		tn.base = Image_GetTexture(lc, "filter/doom/hires", 0, file, doompalette, 64, 64, TF_8PAL24);
+	}
+	else
+		tn.base = Image_GetTexture(name, NULL, 0, file, doompalette, 64, 64, TF_8PAL24);	//name w/o .raw: else "format unsupported"
 	Z_Free(file);
 	if (!TEXVALID(tn.base)) return NULL;
 	sh = R_RegisterShader(va("doom_flatanim/%s", lump), SUF_NONE, "{\n{\nmap $diffuse\nrgbgen vertex\nalphagen vertex\n}\n}\n");
@@ -5438,10 +5456,11 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 	//hi-res textures: enabling doom_hires turns on FTE's external-texture replacement (gl_load24bit),
 	//so each wall/flat/sprite will use an external image named after it (e.g. flats/NUKAGE1.png,
 	//<wallname>.png, sprites/POSSA1.png) when one is present, falling back to the WAD art otherwise.
-	if ((int)Cvar_Get("doom_hires", "0", CVAR_ARCHIVE, "Doom")->value)
+	qboolean hires = (int)Cvar_Get("doom_hires", "0", CVAR_ARCHIVE, "Doom")->value;
+	if (hires)
 	{
 		cvar_t *l24 = Cvar_FindVar("gl_load24bit");
-		if (l24 && !l24->ival) Cvar_SetValue(l24, 1);
+		if (l24 && !l24->ival) Cvar_SetValue(l24, 1);	//external-image replacement must be on for the DHTP lookup
 	}
 
 	if (dm->skytex >= 0)
@@ -5506,7 +5525,15 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 			void *file = FS_LoadMallocFile(va2(tmp, sizeof(tmp), "%s.raw", dm->textures[texnum].name), NULL);
 			if (file)
 			{
-				tn.base = Image_GetTexture(dm->textures[texnum].name, NULL, 0, file, doompalette, 64, 64, TF_8PAL24);
+				//hi-res flat replacement (DHTP): flats live in the same filter/doom/hires/<name>.png dir,
+				//keyed by the bare flat name (no "flats/" prefix). 64x64 palettised WAD flat is the fallback.
+				if (hires)
+				{
+					char lc[16]; Q_strncpyz(lc, dm->textures[texnum].name+6, sizeof(lc)); Q_strlwr(lc);
+					tn.base = Image_GetTexture(lc, "filter/doom/hires", 0, file, doompalette, 64, 64, TF_8PAL24);
+				}
+				else
+					tn.base = Image_GetTexture(dm->textures[texnum].name, NULL, 0, file, doompalette, 64, 64, TF_8PAL24);
 				Z_Free(file);
 			}
 			dm->textures[texnum].width = 64;
