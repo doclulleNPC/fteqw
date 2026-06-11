@@ -13,7 +13,7 @@ static shader_t *Doom_MonsterSpriteShader(const char *lump, short *w, short *h, 
 static shader_t *Doom_SpriteShaderFor(const char *lump, texid_t tex);
 static void Doom_VoxShader(void);
 static qboolean Doom_DrawVoxelByName(const char *name, const vec3_t origin, float yawdeg, float scale);
-static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale);
+static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale, float fith);
 static qboolean Doom_HasModel(const char *spr);	//does an MD2/IQM model def exist for this sprite?
 static void Doom_EmitFX(doommap_t *dm);	//drain dm->fx -> particle effects (client render)
 //MD2 animation phases (doommodels.def): monster walk/attack/pain/die/gib; decorations use 'walk' for idle/spin.
@@ -1918,8 +1918,8 @@ static void R_DoomDrawSprites(doommap_t *dm)
 			//The "walk" phase holds the idle/spin frames; count=0 steps `spin` through them directly.
 			vec3_t mo;
 			VectorCopy(s->origin, mo); mo[2]+=modz;
-			if (Doom_DrawModel(s->voxname, DMDL_WALK, spin, 0, mo, myaw, modscale) ||
-			    Doom_DrawModel(pfx,        DMDL_WALK, spin, 0, mo, myaw, modscale))
+			if (Doom_DrawModel(s->voxname, DMDL_WALK, spin, 0, mo, myaw, modscale, (float)s->h) ||
+			    Doom_DrawModel(pfx,        DMDL_WALK, spin, 0, mo, myaw, modscale, (float)s->h))
 				continue;
 		}
 		if (!hasmodel && usevox && s->voxname[0] && Doom_DrawVoxelByName(s->voxname, s->origin, vyaw, voxscale))
@@ -5062,12 +5062,12 @@ static shader_t *Doom_SurfaceShader(galiasinfo_t *surf, shader_t *fallback)
 	}
 	return fallback;
 }
-static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
+static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale, float fith)
 {	//render ONE model def entry for the given phase/frame. Iterates ALL surfaces (MD2s have one; the
 	//DHMP IQM/glTF models are multi-surface), each with its own skin shader. false -> nothing drawn.
 	galiasinfo_t *inf, *surf; model_t *mod=NULL; shader_t *sh=NULL;
-	int slot, listlen, li, frame, i, nv, surfnum; mesh_t mesh; float c,s,a, hdscale;
-	qboolean drewany=false, usedskel=false;
+	int slot, listlen, li, frame, i, nv, surfnum; mesh_t mesh; float c,s,a, hdscale, es_base, cx=0,cy=0,bz=0;
+	qboolean drewany=false, usedskel=false, modelskel;
 	entity_t re;
 	listlen=dm->phcount[phase]; if (listlen<=0) return false;
 	slot=dm->phslot[phase];
@@ -5075,7 +5075,18 @@ static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int cou
 	inf=Mod_Extradata(mod); if (!inf || inf->numverts<=0) return false;	//(skeletal models may have 0 baked anims)
 	//rest-pose entity used to CPU-skin skeletal (IQM) surfaces via the engine (Alias_GAliasBuildMesh).
 	memset(&re,0,sizeof(re)); re.model=mod; re.framestate.g[FS_REG].lerpweight[0]=1;
-	hdscale=Cvar_Get("doom_hdscale","1",CVAR_ARCHIVE,"Doom")->value;	//extra scale for HD/skeletal models
+	hdscale=Cvar_Get("doom_hdscale","1",CVAR_ARCHIVE,"Doom")->value;	//extra scale knob for HD/skeletal models
+	//Skeletal (IQM) models are authored at arbitrary (often huge) scale, so normalise each one to the
+	//thing's sprite height (fith, in Doom units) using the model's bounding box, centre it horizontally
+	//and stand its feet on the origin. MD2s are already authored at Doom scale/feet-origin -> use scale.
+	modelskel = (inf->numbones>0);
+	if (modelskel)
+	{
+		float mh = mod->maxs[2]-mod->mins[2];
+		es_base = (fith>1 && mh>0.001f) ? (fith/mh)*hdscale : scale*hdscale;
+		cx=(mod->mins[0]+mod->maxs[0])*0.5f; cy=(mod->mins[1]+mod->maxs[1])*0.5f; bz=mod->mins[2];
+	}
+	else es_base = scale;
 	if (count==0)
 		li = ((idx%listlen)+listlen)%listlen;	//wrap: step idx through the list looping (idle/spin decorations)
 	else if (count<0)
@@ -5090,7 +5101,7 @@ static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int cou
 	for (surf=inf, surfnum=0; surf; surf=surf->nextsurf, surfnum++)
 	{
 		shader_t *ssh; int f2=frame; const char *snm=surf->surfacename;
-		vecV_t *vsrc; qboolean skel=false; float es;
+		vecV_t *vsrc; qboolean skel=false;
 		if (surf->numverts<=0) continue;
 		//Skip "death"/exploded sub-meshes only on a LIVE phase - the DHMP barrel packs its intact and
 		//exploded geometry in one model, so a standing barrel must not show the wreckage. But a
@@ -5128,10 +5139,12 @@ static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int cou
 			doommdlcol=BZ_Realloc(doommdlcol,doommdlcap*sizeof(byte_vec4_t));
 			memset(doommdlcol,0xff,doommdlcap*sizeof(byte_vec4_t));	//fullbright white
 		}
-		es = skel ? scale*hdscale : scale;
 		for (i=0;i<nv;i++)
-		{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet
-			float lx=vsrc[i][0]*es, ly=vsrc[i][1]*es, lz=vsrc[i][2]*es;
+		{	//model space (X fwd, Y left, Z up) -> world: scale, yaw about Z, translate to the feet.
+			//skeletal: also centre horizontally on the origin and stand feet on it (cx/cy/bz).
+			float lx,ly,lz;
+			if (skel) { lx=(vsrc[i][0]-cx)*es_base; ly=(vsrc[i][1]-cy)*es_base; lz=(vsrc[i][2]-bz)*es_base; }
+			else      { lx=vsrc[i][0]*es_base;      ly=vsrc[i][1]*es_base;      lz=vsrc[i][2]*es_base; }
 			doommdlxyz[i][0]=origin[0]+lx*c-ly*s;
 			doommdlxyz[i][1]=origin[1]+lx*s+ly*c;
 			doommdlxyz[i][2]=origin[2]+lz;
@@ -5143,17 +5156,16 @@ static qboolean Doom_DrawModelEntry(doommodel_t *dm, int phase, int idx, int cou
 	if (usedskel) Alias_FlushCache();	//re was on the stack - clear the per-entity skin cache
 	return drewany;
 }
-static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale)
+static qboolean Doom_DrawModel(const char *spr, int phase, int idx, int count, const vec3_t origin, float yawdeg, float scale, float fith)
 {	//Try EVERY model def for this sprite (HD/DHMP entry first, then xmodels MD2). An entry that can't
-	//render - e.g. a skeletal DHMP IQM this simple path can't skin - draws nothing and we fall
-	//through to the next def, so things don't drop to a sprite just because an HD model exists but
-	//isn't drawable. false -> no def could draw it (caller then falls back to voxel/sprite).
+	//render falls through to the next. fith = the thing's sprite height in Doom units, used to
+	//normalise skeletal (IQM) models to size. false -> no def could draw it (caller falls back).
 	int mi;
 	if (phase<0 || phase>=DMDL_NUMPH) return false;
 	Doom_LoadModelDef();
 	for (mi=0; mi<doommodelcount; mi++)
 		if (!strcmp(doommodels[mi].spr, spr) &&
-		    Doom_DrawModelEntry(&doommodels[mi], phase, idx, count, origin, yawdeg, scale))
+		    Doom_DrawModelEntry(&doommodels[mi], phase, idx, count, origin, yawdeg, scale, fith))
 			return true;
 	return false;
 }
@@ -5279,7 +5291,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		if (usemod && mph>=0)
 		{	//MD2 model for this monster+phase
 			vec3_t mo; VectorCopy(m->origin, mo); mo[2]+=modz;
-			if (Doom_DrawModel(m->spr, mph, midx, mcount, mo, m->yaw+modyaw, modscale)) continue;
+			if (Doom_DrawModel(m->spr, mph, midx, mcount, mo, m->yaw+modyaw, modscale, (float)shh)) continue;
 		}
 		if (!hasmodel && usevox && vlet && vbase)
 		{	//voxel model for this frame (only when there's no MD2 def, so we never mix the two)
