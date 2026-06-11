@@ -1857,13 +1857,14 @@ static void R_DoomDrawSprites(doommap_t *dm)
 	byte_vec4_t col[4];
 	index_t idx[6] = {0,1,2, 0,2,3};
 
-	int usevox, usemod, spin; float voxscale, voxyaw, modscale, decoryaw, modz, spinrate;
+	int usevox, usemod, usehd, spin; float voxscale, voxyaw, modscale, decoryaw, modz, spinrate;
 	if (!dm->numsprites)
 		return;
-	usevox  = (int)Cvar_Get("doom_voxels", "1", CVAR_ARCHIVE, "Doom")->value;
+	usevox  = (int)Cvar_Get("doom_voxels", "0", CVAR_ARCHIVE, "Doom")->value;	//default OG sprites
 	voxscale= Cvar_Get("doom_voxscale", "1", CVAR_ARCHIVE, "Doom")->value;
 	voxyaw  = Cvar_Get("doom_voxyaw", "90", CVAR_ARCHIVE, "Doom")->value;
-	usemod  = (int)Cvar_Get("doom_models", "1", CVAR_ARCHIVE, "Doom")->value;	//MD2 item/key models take priority over voxels
+	usemod  = (int)Cvar_Get("doom_models", "0", CVAR_ARCHIVE, "Doom")->value;	//full xmodels MD2 set (off by default)
+	usehd   = (int)Cvar_Get("doom_hd", "1", CVAR_ARCHIVE, "Doom")->value;		//curated HD models (on by default)
 	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;
 	//decorations have no AI facing, so they sit at a fixed world yaw. Their models are authored 90 CW
 	//of the monster convention (doom_modyaw 0), hence a separate offset - default -90 (90 CW).
@@ -1911,8 +1912,8 @@ static void R_DoomDrawSprites(doommap_t *dm)
 		pfx[0]=s->voxname[0]; pfx[1]=s->voxname[1]; pfx[2]=s->voxname[2]; pfx[3]=s->voxname[3]; pfx[4]=0;
 		//one render mode per thing: if it has an MD2 def, it's an MD2 thing - never fall to voxel
 		//(missing -> sprite), so we never mix MD2 and voxel on the same object.
-		hasmodel = usemod && (Doom_HasModel(s->voxname) || Doom_HasModel(pfx));
-		if (usemod && s->voxname[0])
+		hasmodel = (usemod||usehd) && (Doom_HasModel(s->voxname) || Doom_HasModel(pfx));
+		if ((usemod||usehd) && s->voxname[0])
 		{	//MD2 model for this decoration/pickup, if a def exists. Try the full sprite+frame name
 			//first (e.g. PLAYN dead vs PLAYW gibbed share the PLAY prefix), then the 4-char prefix.
 			//The "walk" phase holds the idle/spin frames; count=0 steps `spin` through them directly.
@@ -4812,13 +4813,15 @@ static void Doom_ParseModelDef(const char *fname)
 	BZ_Free(file);
 }
 static void Doom_LoadModelDef(void)
-{	//load the model defs once. When doom_hd is set, the DHMP HD models (doommodels_dhmp.def) are
-	//parsed FIRST so they win in Doom_GetModel's first-match lookup; xmodels.pk3 covers the rest.
+{	//Load the model defs once, per the mode cvars. Default is OG Doom sprites for everything; a
+	//curated set of HD (DHMP) models is layered on when doom_hd is set, and the full xmodels.pk3
+	//MD2 set only when doom_models is set. doom_hd is parsed first so it wins the first-match lookup.
 	if (doommodelsloaded) return;
 	doommodelsloaded=true;
-	if ((int)Cvar_Get("doom_hd","0",CVAR_ARCHIVE,"Doom")->value)	//opt-in: DHMP IQMs are skeletal and not renderable by this path yet
+	if ((int)Cvar_Get("doom_hd","1",CVAR_ARCHIVE,"Doom")->value)		//curated HD models (on by default)
 		Doom_ParseModelDef("doommodels_dhmp.def");
-	Doom_ParseModelDef("doommodels.def");
+	if ((int)Cvar_Get("doom_models","0",CVAR_ARCHIVE,"Doom")->value)	//full xmodels MD2 set (off by default = sprites)
+		Doom_ParseModelDef("doommodels.def");
 }
 static doommodel_t *Doom_GetModel(const char *spr)
 {
@@ -4863,8 +4866,9 @@ void Doom_PreloadModels(void)
 {	//load every MD2 def's slots up front (at map-load, main thread) so the synchronous loads
 	//never happen mid-render. Cheap (a handful of small models); skips any that fail to load.
 	int i, slot; model_t *m; shader_t *s;
-	if (!(int)Cvar_Get("doom_models", "1", CVAR_ARCHIVE, "Doom")->value)
-		return;	//models disabled - don't pay the load cost
+	if (!(int)Cvar_Get("doom_models","0",CVAR_ARCHIVE,"Doom")->value &&
+	    !(int)Cvar_Get("doom_hd","1",CVAR_ARCHIVE,"Doom")->value)
+		return;	//neither MD2 nor HD models enabled (pure sprites) - don't pay the load cost
 	Doom_LoadModelDef();
 	for (i=0;i<doommodelcount;i++)
 		for (slot=0;slot<3;slot++)
@@ -5205,16 +5209,17 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 	byte_vec4_t col[4];
 	index_t idx[6] = {0,1,2, 0,2,3};
 
-	int sprrot, sprfreeze, usevox, usemod;
+	int sprrot, sprfreeze, usevox, usemod, usehd;
 	float voxscale, voxyaw, modscale, modyaw, modz;
 	if (!dm->nummonsters && !dm->numprojectiles)
 		return;
 	sprrot = (int)Cvar_Get("doom_sprrot", "1", CVAR_ARCHIVE, "Doom Sprites")->value;	//1=8-way+mirror, 0=front only
 	sprfreeze = (int)Cvar_Get("doom_sprfreeze", "-1", CVAR_ARCHIVE, "Doom Sprites")->value;	//>=0 holds that walk frame
-	usevox  = (int)Cvar_Get("doom_voxels", "1", CVAR_ARCHIVE, "Doom")->value;	//1=voxel models, 0=sprites
+	usevox  = (int)Cvar_Get("doom_voxels", "0", CVAR_ARCHIVE, "Doom")->value;	//default OG sprites (0)
 	voxscale= Cvar_Get("doom_voxscale", "1", CVAR_ARCHIVE, "Doom")->value;		//world units per voxel
 	voxyaw  = Cvar_Get("doom_voxyaw", "90", CVAR_ARCHIVE, "Doom")->value;		//facing offset (deg) for tuning
-	usemod  = (int)Cvar_Get("doom_models", "1", CVAR_ARCHIVE, "Doom")->value;	//1=MD2 models (where a def exists) take priority over voxels
+	usemod  = (int)Cvar_Get("doom_models", "0", CVAR_ARCHIVE, "Doom")->value;	//full xmodels MD2 set (off by default)
+	usehd   = (int)Cvar_Get("doom_hd", "1", CVAR_ARCHIVE, "Doom")->value;		//curated HD models (on by default)
 	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;		//MD2 scale (Vavoom models are ~1:1 with map units)
 	modyaw  = Cvar_Get("doom_modyaw", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 facing offset (deg); 0 after the +90 voxel default was rotated 90 CW to match these models
 	modz    = Cvar_Get("doom_modz", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 vertical offset (deg) for tuning
@@ -5300,7 +5305,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 				vlet = 'A';
 			else { const char *ws=Doom_WalkFrames(m->spr); if(ws&&wf<(int)strlen(ws))vlet=ws[wf]; }
 		}
-		if ((usemod || usevox) && mph>=0)
+		if ((usemod || usevox || usehd) && mph>=0)
 		{	//behind-camera cull (the model/voxel draw is heavier than a billboard)
 			vec3_t tom;
 			VectorSubtract(m->origin, r_refdef.vieworg, tom);
@@ -5310,9 +5315,9 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 		//MD2 and voxel (looks jarring, e.g. an MD2 walk then a voxel death). If this monster has an
 		//MD2 def at all it's an "MD2 thing": render MD2, and if a phase's MD2 is missing fall back to
 		//the SPRITE, not the voxel. Only monsters with no MD2 def use voxels.
-		qboolean hasmodel = usemod && Doom_HasModel(m->spr);
-		if (usemod && mph>=0)
-		{	//MD2 model for this monster+phase
+		qboolean hasmodel = (usemod||usehd) && Doom_HasModel(m->spr);
+		if ((usemod||usehd) && mph>=0)
+		{	//HD/MD2 model for this monster+phase (HD takes priority where a def exists)
 			vec3_t mo; VectorCopy(m->origin, mo); mo[2]+=modz;
 			if (Doom_DrawModel(m->spr, mph, midx, mcount, mo, m->yaw+modyaw, modscale, (float)shh)) continue;
 		}
