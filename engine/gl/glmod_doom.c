@@ -5021,30 +5021,53 @@ void Doom_DrawViewModel(void)
 		Doom_DrawVMMesh(doomvm[wi].flash, doomvm[wi].fsh, ff, base, fwd, right, up, scale, BEF_FORCENODEPTH|BEF_FORCEADDITIVE);
 	}
 }
-//Resolve an IQM/glTF surface material name (e.g. "barrel_lp", "obj_bubbles2") to a high-res diffuse
-//texture under models_dhmp/ (the converted DHMP HD models). Tries a few name cleanups since the
-//material names don't match the texture filenames 1:1. Returns the path (incl. .png) in 'out'.
+//Resolve an IQM surface material name (e.g. "obj_pillar_tall", "barrel_lp") to a high-res diffuse
+//texture under models_dhmp/. The material names don't match the texture filenames 1:1 (and aren't
+//derivable - the original GZDoom skin assignment was lost in the FBX->IQM conversion), so we fuzzy-
+//match by longest common prefix against the actual diffuse textures present in the folder.
+#define DOOM_HDTEXMAX 512
+static char doomhdtex[DOOM_HDTEXMAX][48]; static int doomhdtexn; static qboolean doomhdtexloaded;
+static int QDECL Doom_HDTex_cb(const char *fname, qofs_t fsize, time_t mtime, void *parm, searchpathfuncs_t *spath)
+{	//collect diffuse texture basenames (drop the PBR map files - we only want the colour map)
+	static const char *pbr[]={"_norm","_gloss","_glow","_spec","_ao","_gs","_n","_e","_s","_l","_h"};
+	const char *b; char nm[48]; int n,k;
+	if (doomhdtexn>=DOOM_HDTEXMAX) return true;
+	b=strrchr(fname,'/'); b=b?b+1:fname;
+	Q_strncpyz(nm,b,sizeof(nm)); n=(int)strlen(nm);
+	if (n>4 && !Q_strcasecmp(nm+n-4,".png")) { nm[n-4]=0; n-=4; } else return true;
+	for (k=0;k<(int)(sizeof(pbr)/sizeof(pbr[0]));k++)
+	{ int sl=(int)strlen(pbr[k]); if (n>sl && !Q_strcasecmp(nm+n-sl,pbr[k])) return true; }	//skip PBR maps
+	Q_strncpyz(doomhdtex[doomhdtexn++],nm,sizeof(doomhdtex[0]));
+	return true;
+}
 static qboolean Doom_HDTexture(const char *mat, char *out, size_t outsz)
 {
-	char b[64], c[4][64]; int i, n;
+	char b[64]; int i,n,best=-1,bestlen=0;
 	if (!mat || !mat[0]) return false;
-	Q_strncpyz(b, mat, sizeof(b));
-	if (!Q_strncmp(b,"obj_",4)) memmove(b, b+4, strlen(b+4)+1);	//strip the "obj_" prefix
-	Q_strncpyz(c[0], b, 64);					//as-is
-	Q_strncpyz(c[1], b, 64); n=(int)strlen(c[1]);			//strip trailing digits, then a plural 's'
-	while (n>0 && c[1][n-1]>='0' && c[1][n-1]<='9') c[1][--n]=0;
-	if (n>1 && c[1][n-1]=='s') c[1][--n]=0;
-	Q_strncpyz(c[2], b, 64); n=(int)strlen(c[2]);			//strip a "_lp" (low-poly) suffix
-	if (n>3 && !Q_strcmp(c[2]+n-3,"_lp")) c[2][n-3]=0;
-	Q_strncpyz(c[3], c[2], 64); n=(int)strlen(c[3]);		//strip _lp, then digits + 's'
-	while (n>0 && c[3][n-1]>='0' && c[3][n-1]<='9') c[3][--n]=0;
-	if (n>1 && c[3][n-1]=='s') c[3][--n]=0;
-	for (i=0;i<4;i++)
+	Q_strncpyz(b,mat,sizeof(b));
+	if (!Q_strncmp(b,"obj_",4)) memmove(b,b+4,strlen(b+4)+1);	//strip "obj_"
+	n=(int)strlen(b);
+	if (n>3 && !Q_strcmp(b+n-3,"_lp")) { b[n-3]=0; n-=3; }		//strip "_lp"
+	while (n>0 && b[n-1]>='0' && b[n-1]<='9') b[--n]=0;		//strip trailing digits
+	if (!b[0]) return false;
+	//aliases for materials that share NO name with their texture (the GZDoom skin map was lost in
+	//conversion). Extend as needed per model; the fuzzy match below handles everything else.
 	{
-		if (!c[i][0]) continue;
-		Q_snprintfz(out, outsz, "models_dhmp/%s.png", c[i]);
-		if (COM_FCheckExists(out)) return true;
+		static const struct { const char *m, *t; } al[]={
+			{"caco_alive","body"}, {"caco_death","body_dead"},
+		};
+		for (i=0;i<(int)(sizeof(al)/sizeof(al[0]));i++)
+			if (!Q_strcasecmp(b,al[i].m)) { Q_strncpyz(b,al[i].t,sizeof(b)); break; }
 	}
+	if (!doomhdtexloaded) { doomhdtexloaded=true; doomhdtexn=0; COM_EnumerateFiles("models_dhmp/*.png",Doom_HDTex_cb,NULL); }
+	for (i=0;i<doomhdtexn;i++)	//longest case-insensitive common prefix; on a tie prefer the shortest
+	{				//(closest) name, so "shotgun" beats "shotgunammobox" and "skull" beats "skull_yellow"
+		const char *t=doomhdtex[i]; int l=0;
+		while (b[l] && t[l])
+		{ char x=b[l],y=t[l]; if(x>='A'&&x<='Z')x+=32; if(y>='A'&&y<='Z')y+=32; if(x!=y)break; l++; }
+		if (l>bestlen || (l==bestlen && best>=0 && strlen(t)<strlen(doomhdtex[best]))) { bestlen=l; best=i; }
+	}
+	if (best>=0 && bestlen>=3) { Q_snprintfz(out,outsz,"models_dhmp/%s.png",doomhdtex[best]); return true; }
 	return false;
 }
 //Shader for one model surface: an HD diffuse texture if the material resolves under models_dhmp/,
