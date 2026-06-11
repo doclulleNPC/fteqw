@@ -4874,7 +4874,7 @@ void Doom_PreloadModels(void)
 		for (slot=0;slot<3;slot++)
 			if (doommodels[i].mdl[slot][0])
 				Doom_ModelSlot(&doommodels[i], slot, &m, &s);
-	if ((int)Cvar_Get("doom_viewmodel", "1", CVAR_ARCHIVE, "Doom")->value)
+	if ((int)Cvar_Get("doom_viewmodel","0", CVAR_ARCHIVE, "Doom")->value)
 		for (i=0;i<9;i++)
 			Doom_LoadViewWeapon(i);	//first-person weapon models, loaded up front (main thread)
 }
@@ -4917,7 +4917,7 @@ void Doom_LoadViewWeapon(int wi)
 }
 qboolean Doom_ViewModelActive(int wi)
 {	//true if a 3D viewmodel will draw for this weapon (so the 2D HUD weapon can stand down)
-	if (!(int)Cvar_Get("doom_viewmodel","1",CVAR_ARCHIVE,"Doom")->value) return false;
+	if (!(int)Cvar_Get("doom_viewmodel","0",CVAR_ARCHIVE,"Doom")->value) return false;
 	return wi>=0 && wi<9 && doomvm[wi].view && doomvm[wi].vsh;
 }
 static void Doom_DrawVMMesh(model_t *mod, shader_t *sh, int frame, const vec3_t base,
@@ -4954,7 +4954,7 @@ void Doom_DrawViewModel(void)
 	static int vm_shown=-1, vm_target=-1; static double vm_last=0;
 
 	if (!cl.worldmodel || cl.worldmodel->fromgame!=fg_doom || !pv) return;
-	if (!(int)Cvar_Get("doom_viewmodel","1",CVAR_ARCHIVE,"Doom")->value) return;
+	if (!(int)Cvar_Get("doom_viewmodel","0",CVAR_ARCHIVE,"Doom")->value) return;
 	health = pv->stats[STAT_HEALTH];
 	wi = pv->stats[STAT_ACTIVEWEAPON]; if (wi<0||wi>=9) wi=2;
 	fi = pv->stats[STAT_WEAPONFRAME];
