@@ -381,11 +381,11 @@ typedef struct doommap_s
 		short		w[4][8], h[4][8], xo[4][8], yo[4][8];
 		qbyte		wmir[4][8];	// 1 = this rotation comes from a mirrored combined lump (drawn flipped)
 		shader_t	*atkfr[4];	// attack animation sequence
-		short		afw[4], afh[4], afxo[4];
+		short		afw[4], afh[4], afxo[4], afyo[4];
 		shader_t	*painfr[4];	// pain animation sequence
-		short		pfw[4], pfh[4], pfxo[4];
+		short		pfw[4], pfh[4], pfxo[4], pfyo[4];
 		shader_t	*deathfr[12];	// death animation sequence (last frame is the resting corpse)
-		short		dfw[12], dfh[12], dfxo[12];
+		short		dfw[12], dfh[12], dfxo[12], dfyo[12];	// yo = sprite topoffset, so the frame sits on the floor (not a height below it)
 		qbyte		ndeath;		// number of loaded death frames
 		qbyte		natk;		// number of loaded attack frames
 		qbyte		npain;		// number of loaded pain frames
@@ -525,32 +525,53 @@ static float Doom_FindNextHighestFloor(doommap_t *dm, int sec_idx)
 }
 
 // Return true if linedef special is a door/sector type we handle
-qboolean Doom_IsActivatableLinedef(int special)
+//USE-activated lines (Doom P_UseSpecialLine): manual push-doors (D1/DR), wall switches (S1/SR) and
+//the switch exits + switch stair-builders. These fire ONLY when the player presses +use facing the
+//line - NOT by walking over it.
+qboolean Doom_IsUseLinedef(int special)
 {
 	switch(special)
 	{
-	case 1:  case 26: case 27: case 28:	// DR doors (reusable)
-	case 31: case 32: case 33: case 34:	// D1 doors (one-shot)
-	case 117: case 118:			// fast doors
+	case 1:  case 26: case 27: case 28:	// DR doors (reusable, push)
+	case 31: case 32: case 33: case 34:	// D1 doors (one-shot, push)
+	case 117: case 118:			// fast doors (DR/D1)
+	case 61: case 63:			// SR open stay / close (switch)
+	case 103:				// S1 open stay (switch)
+	case 62: case 123:			// Plat Down-Wait-Up-Stay (SR/S1 switch)
+	case 7:  case 127:			// Build stairs (S1 step-8 / S1 turbo step-16)
+	case 11: case 51:			// Exit level (S1 normal / S1 secret)
+		return true;
+	}
+	return false;
+}
+//WALK-activated lines (Doom P_CrossSpecialLine): W1/WR triggers crossed by walking over them - doors,
+//lifts, floor moves, walk stair-builders and the walk exits. These must NOT respond to +use.
+qboolean Doom_IsWalkLinedef(int special)
+{
+	switch(special)
+	{
 	case 2:  case 3:  case 4:		// W1 open/close
-	case 46:				// GR open stays
-	case 61: case 63:			// SR open stay / close
-	case 103:				// S1 open stay
 	case 75: case 76:			// WR close/open
-	case 10: case 88:			// Plat Down-Wait-Up-Stay
+	case 46:				// GR open stays (gun; no shoot-trigger yet, treat as walk so it still opens)
+	case 10: case 88:			// Plat Down-Wait-Up-Stay (W1/WR)
 	case 22:				// Raise floor to next highest floor and change texture
 	case 19:				// Lower floor to highest surrounding floor
 	case 36:				// W1 Lower floor (turbo) to 8 above highest surrounding floor
 	case 38:				// Lower floor to lowest surrounding floor
 	case 5:  case 91:			// Raise floor to lowest surrounding ceiling
-	case 62: case 123:			// Plat Down-Wait-Up-Stay (SR/S1)
-	case 11: case 51: case 52: case 124:	// Exit level
+	case 8:  case 100:			// Build stairs (W1 step-8 / W1 turbo step-16)
 	case 30:				// Raise floor to shortest texture height
 	case 37:				// Lower floor to lowest adjacent and change texture
 	case 40:				// Raise ceiling lower floor
+	case 52: case 124:			// Exit level (W1 normal / W1 secret)
 		return true;
 	}
 	return false;
+}
+//either trigger class - used by the apply/activate guards, which don't care HOW it was triggered.
+qboolean Doom_IsActivatableLinedef(int special)
+{
+	return Doom_IsUseLinedef(special) || Doom_IsWalkLinedef(special);
 }
 
 static int Doom_FindOrAddSectorAnim(doommap_t *dm, int sec_idx)
@@ -574,11 +595,58 @@ static int Doom_FindOrAddSectorAnim(doommap_t *dm, int sec_idx)
 	return (int)dm->numactive_doors++;
 }
 
+//Build a staircase starting at `startsec` (Doom EV_BuildStairs). Raise the start sector's floor by one
+//step, then walk to the adjacent sector across a two-sided line whose FRONT is the current step and
+//whose floor flat matches the start sector's; raise it one more step; repeat until the chain ends
+//(no matching neighbour). Each step is an ordinary one-shot floor-raise on the sector mover.
+static void Doom_BuildStairs(doommap_t *dm, int startsec, int special)
+{
+	qboolean turbo = (special==100||special==127);
+	float step  = turbo ? 16.0f : 8.0f;			//turbo builds 16-unit risers, slow builds 8
+	float speed = turbo ? DOOR_SPEED*2.0f : DOOR_SPEED*0.25f;//Doom: turbo=FLOORSPEED*4, slow=FLOORSPEED/4
+	int cur = startsec, floortex, guard;
+	float height;
+	if (cur < 0 || (unsigned)cur >= dm->numsectors) return;
+	floortex = dm->sector[cur].floortex;
+	height   = dm->sector[cur].floorheight;
+	for (guard = 0; guard < 64; guard++)	//cap the chain length (a sane bound; vanilla stairs are short)
+	{
+		struct doorsector_s *d = &dm->doorsectors[Doom_FindOrAddSectorAnim(dm, cur)];
+		unsigned int j; int next = -1;
+		height += step;
+		d->special = special; d->state = 1; d->move_floor = true; d->repeating = false;
+		d->wait_max = 0; d->frac = 0; d->speed = speed;
+		d->floor_original = dm->sector[cur].floorheight;
+		d->floor_target   = (short)height;
+		//next step: an adjacent sector across a two-sided line whose FRONT is the current step and whose
+		//floor flat matches the start; skip sectors already enrolled in THIS staircase.
+		for (j = 0; j < dm->numlinedefs; j++)
+		{
+			dlinedef_t *ld = &dm->linedef[j];
+			int other, k; qboolean used = false;
+			if (ld->sidedef[0]==0xffff || ld->sidedef[1]==0xffff) continue;
+			if (dm->sidedef[ld->sidedef[0]].sector != cur) continue;	//line's FRONT must be the current step
+			other = dm->sidedef[ld->sidedef[1]].sector;
+			if (other < 0 || (unsigned)other >= dm->numsectors) continue;
+			if (dm->sector[other].floortex != floortex) continue;	//a different flat ends the staircase
+			for (k = 0; k < (int)dm->numactive_doors; k++)
+				if (dm->doorsectors[k].sector_idx==other && dm->doorsectors[k].special==special) { used = true; break; }
+			if (used) continue;
+			next = other; break;
+		}
+		if (next < 0) break;
+		cur = next;
+	}
+}
+
 static void Doom_ApplySpecialToSector(doommap_t *dm, int si, int special, int tag, int linedef_idx)
 {
 	int anim_idx = Doom_FindOrAddSectorAnim(dm, si);
 	struct doorsector_s *d = &dm->doorsectors[anim_idx];
 	d->special = special;
+
+	if (special==7 || special==8 || special==100 || special==127)	//build-stairs: handled as a chain
+	{	Doom_BuildStairs(dm, si, special); return; }
 
 	switch(special) {
 		// --- DOORS ---
@@ -2986,6 +3054,7 @@ int Doom_OneShotUse(int special)
 	case 103:					//S1 door open stay
 	case 11: case 51: case 52: case 124:		//exits
 	case 123:					//S1 fast lift
+	case 7: case 127:				//S1 build stairs (step-8 / turbo step-16): one-shot
 		return 1;
 	default: return 0;
 	}
@@ -3334,7 +3403,7 @@ static void Doom_LoadMonsters(doommap_t *dm)
 				Q_snprintfz(pl, sizeof(pl), "%s%c1", mi.spr, pc); //rotated (front)
 				psh = Doom_MonsterSpriteShader(pl, &pw,&ph,&pxo,&pyo);
 				if (!psh) { Q_snprintfz(pl, sizeof(pl), "%s%c0", mi.spr, pc); psh = Doom_MonsterSpriteShader(pl, &pw,&ph,&pxo,&pyo); }
-				if (psh) { m->painfr[0]=psh; m->pfw[0]=pw; m->pfh[0]=ph; m->pfxo[0]=pxo; m->npain = 1; }
+				if (psh) { m->painfr[0]=psh; m->pfw[0]=pw; m->pfh[0]=ph; m->pfxo[0]=pxo; m->pfyo[0]=pyo; m->npain = 1; }
 			}
 
 			//load the attack (Missile/Melee) frames, per-monster from the zscript - in order.
@@ -3347,7 +3416,7 @@ static void Doom_LoadMonsters(doommap_t *dm)
 					Q_snprintfz(al, sizeof(al), "%s%c1", mi.spr, aseq[f]); //rotated (front)
 					ash = Doom_MonsterSpriteShader(al, &aw,&ah,&axo,&ayo);
 					if (!ash) { Q_snprintfz(al, sizeof(al), "%s%c0", mi.spr, aseq[f]); ash = Doom_MonsterSpriteShader(al, &aw,&ah,&axo,&ayo); }
-					if (ash) { m->atkfr[m->natk]=ash; m->afw[m->natk]=aw; m->afh[m->natk]=ah; m->afxo[m->natk]=axo; m->natk++; }
+					if (ash) { m->atkfr[m->natk]=ash; m->afw[m->natk]=aw; m->afh[m->natk]=ah; m->afxo[m->natk]=axo; m->afyo[m->natk]=ayo; m->natk++; }
 				}
 			}
 		}
@@ -3373,7 +3442,7 @@ static void Doom_LoadMonsters(doommap_t *dm)
 				char clump[16]; short cw,ch,cxo,cyo; shader_t *csh;
 				Q_snprintfz(clump, sizeof(clump), "%s%c0", dspr, *seq);
 				csh = Doom_MonsterSpriteShader(clump, &cw,&ch,&cxo,&cyo);
-				if (csh) { m->deathfr[m->ndeath]=csh; m->dfw[m->ndeath]=cw; m->dfh[m->ndeath]=ch; m->dfxo[m->ndeath]=cxo; m->ndeath++; }
+				if (csh) { m->deathfr[m->ndeath]=csh; m->dfw[m->ndeath]=cw; m->dfh[m->ndeath]=ch; m->dfxo[m->ndeath]=cxo; m->dfyo[m->ndeath]=cyo; m->ndeath++; }
 				seq++;
 			}
 		}
@@ -4154,7 +4223,7 @@ static void Doom_SpawnMonster(doommap_t *dm, unsigned short type, const vec3_t o
 			char pl[16]; short pw, ph, pxo, pyo; shader_t *psh;
 			Q_snprintfz(pl, sizeof(pl), "%s%c0", mi.spr, (type==3005?'G':'E'));
 			psh = Doom_MonsterSpriteShader(pl, &pw,&ph,&pxo,&pyo);
-			if (psh) { m->painfr[f]=psh; m->pfw[f]=pw; m->pfh[f]=ph; m->pfxo[f]=pxo; }
+			if (psh) { m->painfr[f]=psh; m->pfw[f]=pw; m->pfh[f]=ph; m->pfxo[f]=pxo; m->pfyo[f]=pyo; }
 		}
 		const char *seq = Doom_DeathSeq(mi.spr);
 		m->ndeath = 0;
@@ -4163,7 +4232,7 @@ static void Doom_SpawnMonster(doommap_t *dm, unsigned short type, const vec3_t o
 			char clump[16]; short cw,ch,cxo,cyo; shader_t *csh;
 			Q_snprintfz(clump, sizeof(clump), "%s%c0", mi.spr, *seq);
 			csh = Doom_MonsterSpriteShader(clump, &cw,&ch,&cxo,&cyo);
-			if (csh) { m->deathfr[m->ndeath]=csh; m->dfw[m->ndeath]=cw; m->dfh[m->ndeath]=ch; m->dfxo[m->ndeath]=cxo; m->ndeath++; }
+			if (csh) { m->deathfr[m->ndeath]=csh; m->dfw[m->ndeath]=cw; m->dfh[m->ndeath]=ch; m->dfxo[m->ndeath]=cxo; m->dfyo[m->ndeath]=cyo; m->ndeath++; }
 			seq++;
 		}
 	}
@@ -5289,7 +5358,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			//but the gib model has ~9 frames and only its last one settles on the floor - clamping to
 			//df left it frozen mid-explosion (chunks hanging in the air).
 			if (m->gibbed) { mph=DMDL_GIB; mcount=-1; midx=(int)(m->deathtime/0.15f); }
-			sh = m->deathfr[df]; sw = m->dfw[df]; shh = m->dfh[df]; sxo = m->dfxo[df]; syo = 0;
+			sh = m->deathfr[df]; sw = m->dfw[df]; shh = m->dfh[df]; sxo = m->dfxo[df]; syo = m->dfyo[df];
 			{ const char *ds=(m->atk&MATK_BARREL)?"ABCDE":Doom_DeathSeq(m->spr);
 			  if(m->atk&MATK_BARREL)vbase="BEXP"; if(ds&&df<(int)strlen(ds))vlet=ds[df]; }
 		}
@@ -5298,7 +5367,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			int pf = (int)(m->paintime / 0.1f);
 			if (pf >= m->npain) { m->paintime = -1; pf = 0; } //end pain
 			mph=DMDL_PAIN; midx=pf; mcount=m->npain;
-			sh = m->painfr[pf]; sw = m->pfw[pf]; shh = m->pfh[pf]; sxo = m->pfxo[pf]; syo = 0;
+			sh = m->painfr[pf]; sw = m->pfw[pf]; shh = m->pfh[pf]; sxo = m->pfxo[pf]; syo = m->pfyo[pf];
 			vlet = Doom_PainFrame(m->spr);
 		}
 		else if (m->atktime >= 0 && m->natk > 0)
@@ -5308,7 +5377,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 			if (af >= m->natk) { m->atktime = -1; af = 0; } //end attack
 			mph=DMDL_ATTACK; midx=af; mcount=m->natk;
 			if (m->atkfr[af]) {
-				sh = m->atkfr[af]; sw = m->afw[af]; shh = m->afh[af]; sxo = m->afxo[af]; syo = 0;
+				sh = m->atkfr[af]; sw = m->afw[af]; shh = m->afh[af]; sxo = m->afxo[af]; syo = m->afyo[af];
 			}
 			{ const char *as=Doom_AttackSeq(m->spr); if(as&&af<(int)strlen(as))vlet=as[af]; }
 		}
