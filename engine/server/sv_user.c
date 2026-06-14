@@ -45,6 +45,8 @@ typedef struct {
 } mdoomvertex_sv_t;
 
 qboolean Doom_IsActivatableLinedef(int special);
+qboolean Doom_IsUseLinedef(int special);	//manual doors + switches (+use only)
+qboolean Doom_IsWalkLinedef(int special);	//W1/WR walk-over triggers (crossing only)
 void Doom_ActivateLinedef(struct model_s *model, int linedef_idx);
 void Doom_PlayerAttack(struct model_s *model, const float *org, float yaw, int pellets, int dmgbase, float maxrange);
 void Doom_PlayerProjectile(struct model_s *model, const vec3_t org, float yaw, int type);
@@ -7867,7 +7869,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 			vec3_t mid, delta;
 			float dist, dot;
 
-			if (!Doom_IsActivatableLinedef(ld->types))
+			if (!Doom_IsUseLinedef(ld->types))	//+use only triggers doors/switches, NOT walk-over lines
 				continue;
 			v1 = &dm->vertexes[ld->vert[0]];
 			v2 = &dm->vertexes[ld->vert[1]];
@@ -7968,12 +7970,13 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 							ld->types = 0;							//W1: one-shot, spend it
 					}
 				}
-				else if (Doom_IsActivatableLinedef(ld->types))
-				{	// Generic walk-over (W1 / WR)
+				else if (Doom_IsWalkLinedef(ld->types))
+				{	// Generic walk-over (W1 / WR) - NOT switches/manual doors
 					Doom_ActivateLinedef(sv.world.worldmodel, j);
 					// check if it was a one-shot type (crude: most even types are repeating, odd are one-shot?)
 					// better: hardcode common one-shot W1s
-					if (ld->types == 5 || ld->types == 19 || ld->types == 36 || ld->types == 38 || ld->types == 52 || ld->types == 11)
+					if (ld->types == 5 || ld->types == 19 || ld->types == 36 || ld->types == 38 || ld->types == 52 || ld->types == 11
+					    || ld->types == 8 || ld->types == 100)	//W1 build-stairs: one-shot, spend it
 						ld->types = 0;
 				}
 				break;	//only one crossing handled per frame
