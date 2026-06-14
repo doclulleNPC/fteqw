@@ -7994,10 +7994,13 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 			{
 				float vx = sv_player->v->velocity[0], vy = sv_player->v->velocity[1];
 				float spd2 = vx*vx + vy*vy;
-				if (onground && spd2 > 40.0f*40.0f)
-				{
+				if (spd2 > 40.0f*40.0f)
+				{	//moving: accumulate distance regardless of brief ground flicker. Doom's floor-snap
+					//can drop FL_ONGROUND for single frames while walking, so DON'T reset the accumulator
+					//when momentarily airborne (that bug starved it below the 96u threshold and silenced
+					//footsteps) - just hold the step until we're grounded again, then play it.
 					host_client->doom_stepdist += sqrt(spd2) * host_frametime;
-					if (host_client->doom_stepdist >= 96.0f)
+					if (onground && host_client->doom_stepdist >= 96.0f)
 					{
 						const char *fs = Doom_FootstepSound(sv.world.worldmodel, sv_player->v->origin);
 						if (fs) Doom_PlaySoundName(sv_player->v->origin, fs);
@@ -8005,7 +8008,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 					}
 				}
 				else
-					host_client->doom_stepdist = 48.0f;
+					host_client->doom_stepdist = 48.0f;	//stopped: prime a prompt first step on next move
 			}
 		}
 		VectorCopy(cur, host_client->doom_prevorg);
