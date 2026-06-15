@@ -874,8 +874,8 @@ void Doom_TickDoors(model_t *model, float frametime, const float *playerorg)
 	for (i = 0; i < dm->numlinedefs; i++)
 	{
 		dlinedef_t *ld = &dm->linedef[i];
-		if (ld->types == 48) { // scroll left
-			dm->sidedef[ld->sidedef[0]].texx += 64 * frametime;
+		if (ld->types == 48) { // scroll texture left (Doom P_UpdateSpecials: front sidedef, +1 texel/tic)
+			dm->sidedef[ld->sidedef[0]].texx += 35.0f * frametime;	//35 tics/s -> 35 texels/s, vanilla speed
 		}
 	}
 
@@ -1512,7 +1512,7 @@ int Doom_LoadFlat(doommap_t *dm, char *flatname)
 //unit, so a wall vertex at world-z maps to v = (pegtop - z)/height. Expressing the
 //various Doom peg rules as a single "where does the texture top sit" lets the four
 //cases (upper/lower x pegged/unpegged) share one formula - see R_DrawSSector.
-static void R_DrawWall(doommap_t *dm, int texnum, int s, float pegtop, float x1, float y1, float z1, float x2, float y2, float z2, unsigned int colour4b)
+static void R_DrawWall(doommap_t *dm, int texnum, float s, float pegtop, float x1, float y1, float z1, float x2, float y2, float z2, unsigned int colour4b)
 {
 	doomtexture_t *tex = dm->textures+texnum;
 	mesh_t *mesh = &tex->mesh;
@@ -1521,8 +1521,11 @@ static void R_DrawWall(doommap_t *dm, int texnum, int s, float pegtop, float x1,
 	float t1, t2;
 	unsigned int col;
 
-	s1 = s/tex->width;
-	s2 = s1 + len/tex->width;
+	//s is the texture x-offset in texels (float, so sub-texel scroll/alignment survives). width is an
+	//unsigned short, so cast to float or this would be integer division - which truncated the scroll
+	//offset to whole-texture-width steps (invisible on a tiling texture, so scrollers looked frozen).
+	s1 = s/(float)tex->width;
+	s2 = s1 + len/(float)tex->width;
 
 	t1 = (pegtop - z2)/tex->height;
 	t2 = (pegtop - z1)/tex->height;
