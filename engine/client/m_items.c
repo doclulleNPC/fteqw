@@ -2518,6 +2518,22 @@ void M_Menu_Main_f (void)
 
 	S_LocalSound ("misc/menu2.wav");
 
+#ifdef MAP_DOOM
+	if (COM_FCheckExists("wad/titlepic"))	//Doom IWAD mounted -> a Doom-flavoured main menu over the
+	{					//TITLEPIC backdrop (drawn by Doom_DrawTitle), instead of the bare
+						//"Join server" fallback (Doom has no gfx/ttl_main.lmp etc.).
+		mainm = M_CreateMenu(0);
+		mainm->key = MC_Main_Key;
+		y = 84;
+		mainm->selecteditem = (menuoption_t *)
+		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("New Game      "),	"map e1m1\n");		y += 20;
+		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("Multiplayer   "),	"menu_multi\n");	y += 20;
+		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("^bOptions       "),	"menu_options\n");	y += 20;
+		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("Quit          "),	"menu_quit\n");		y += 20;
+		mainm->cursoritem = (menuoption_t *)MC_AddCursor(mainm, &resel, 54, mainm->selecteditem->common.posy);
+	}
+	else
+#endif
 #ifdef Q2CLIENT
 	if (M_GameType() == MGT_QUAKE2)	//quake2 main menu.
 	{
