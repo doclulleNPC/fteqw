@@ -144,6 +144,43 @@ static void Doom_SetupPlayer(edict_t *ent)
 	Doom_UpdateCurrentAmmo(ent);
 }
 
+// Inter-level inventory carryover. In Doom your weapons/ammo/health/armour persist from one level to
+// the next within an episode; only keys reset. We snapshot the player at the intermission (level exit)
+// and re-apply it when the next map spawns the player, overriding the fresh Doom_SetupPlayer default.
+#define DOOM_KEYBITS 0x7E00	//the 6 key bits in .items (blue/yellow/red, card+skull); cleared each level
+static struct doom_carry_s {
+	qboolean pending;
+	float items, weapon, ammo_nails, ammo_shells, ammo_rockets, ammo_cells, health, armorvalue, armortype;
+} doom_carry;
+
+static void Doom_SaveCarry(edict_t *ent)
+{
+	doom_carry.pending = true;
+	doom_carry.items        = (float)((int)ent->v->items & ~DOOM_KEYBITS);	//weapons kept, keys dropped
+	doom_carry.weapon       = ent->v->weapon;
+	doom_carry.ammo_nails   = ent->v->ammo_nails;
+	doom_carry.ammo_shells  = ent->v->ammo_shells;
+	doom_carry.ammo_rockets = ent->v->ammo_rockets;
+	doom_carry.ammo_cells   = ent->v->ammo_cells;
+	doom_carry.health       = ent->v->health;
+	doom_carry.armorvalue   = ent->v->armorvalue;
+	doom_carry.armortype    = ent->v->armortype;
+}
+static void Doom_ApplyCarry(edict_t *ent)
+{
+	ent->v->items        = doom_carry.items;
+	ent->v->weapon       = doom_carry.weapon;
+	ent->v->ammo_nails   = doom_carry.ammo_nails;
+	ent->v->ammo_shells  = doom_carry.ammo_shells;
+	ent->v->ammo_rockets = doom_carry.ammo_rockets;
+	ent->v->ammo_cells   = doom_carry.ammo_cells;
+	ent->v->armorvalue   = doom_carry.armorvalue;
+	ent->v->armortype    = doom_carry.armortype;
+	if (doom_carry.health > 0) ent->v->health = doom_carry.health;
+	Doom_UpdateCurrentAmmo(ent);
+	doom_carry.pending = false;
+}
+
 //cheat/give helpers (used by `give all|weapons|keys` and IDKFA). The SSG is granted only when its
 //view sprite (SHT2A0) is present - i.e. running the Doom 2 IWAD (-doom2). The Doom 1 / Ultimate Doom
 //WADs have no SHT2, so granting it there would give an invisible weapon that key 3 toggles to.
@@ -5943,6 +5980,8 @@ void SV_SetUpClientEdict (client_t *cl, edict_t *ent)
 		ent->v->solid    = SOLID_SLIDEBOX;
 		ent->v->health   = 100;
 		Doom_SetupPlayer(ent);	//fist+pistol, 50 bullets
+		if (doom_carry.pending)
+			Doom_ApplyCarry(ent);	//arrived from a level exit: keep weapons/ammo/health/armour (keys reset)
 	}
 #endif
 }
@@ -7954,6 +7993,8 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 	{
 		static qboolean wasdown = false;	//edge-detect so a held button doesn't skip instantly
 		qboolean down = (ucmd->buttons & (1u/*attack*/|2u/*jump*/)) || DOOM_USEBIT(ucmd->buttons);
+		if (!doom_carry.pending)
+			Doom_SaveCarry(sv_player);	//snapshot the level-end inventory once, to carry to the next map
 		if (down && !wasdown)
 			Doom_IntermissionButton();
 		wasdown = down;
