@@ -48,6 +48,8 @@ qboolean Doom_IsActivatableLinedef(int special);
 qboolean Doom_IsUseLinedef(int special);	//manual doors + switches (+use only)
 qboolean Doom_IsWalkLinedef(int special);	//W1/WR walk-over triggers (crossing only)
 void Doom_ActivateLinedef(struct model_s *model, int linedef_idx);
+qboolean Doom_IntermissionActive(void);		//end-of-level tally screen is showing
+qboolean Doom_IntermissionButton(void);		//fire/use/jump dismisses/advances the tally
 void Doom_PlayerAttack(struct model_s *model, const float *org, float yaw, int pellets, int dmgbase, float maxrange);
 void Doom_PlayerProjectile(struct model_s *model, const vec3_t org, float yaw, int type);
 void Doom_PlaySound(const vec3_t org, const char *lump);
@@ -59,7 +61,7 @@ void Doom_SwitchUse(struct model_s *model, int linedef_idx);
 int Doom_OneShotUse(int special);
 void Doom_ResetMap(struct model_s *model);
 qboolean Doom_TeleportThing(struct model_s *model, int linedef_idx, float *outorg, float *outyaw);
-void Doom_TryPickups(struct model_s *model, const float *playerorg, float *health, float *armor,
+void Doom_TryPickups(struct model_s *model, const float *playerorg, float *health, float *armor, float *armortype,
 	float *bullets, float *shells, float *rockets, float *cells, float *items, float *weapon);
 
 // Owned-weapons bitmask in .items (KEEP IN SYNC with glmod_doom.c).
@@ -84,13 +86,15 @@ static const struct doomweapon_s {
 	{"Fist",      DWEP_FIST,     -1, 0,  1,  6, 0.50f,  70, false, "ABCD"},
 	{"Chainsaw",  DWEP_CHAINSAW, -1, 0,  1,  6, 0.12f,  80, false, "AB"},
 	{"Pistol",    DWEP_PISTOL,    0, 1,  1,  5, 0.40f, 2000, false, "ABCD"},
-	{"Shotgun",   DWEP_SHOTGUN,   1, 1,  7,  5, 0.85f, 2000, false, "ABCD"},
+	{"Shotgun",   DWEP_SHOTGUN,   1, 1,  7,  5, 0.85f, 2000, false, "ABCDCB"},
 	{"Super SG",  DWEP_SSG,       1, 2, 20,  5, 1.05f, 2000, false, "ABCDEFGHIJ"},
 	{"Chaingun",  DWEP_CHAINGUN,  0, 1,  1,  5, 0.12f, 2000, false, "AB"},
 	{"Rocket",    DWEP_ROCKET,    2, 1,  0,  0, 0.80f, 2000, true,  "AB"},
 	{"Plasma",    DWEP_PLASMA,    3, 1,  0,  0, 0.12f, 2000, true,  "AB"},
 	{"BFG 9000",  DWEP_BFG,       3, 40, 0,  0, 1.00f, 2000, true,  "AB"},
 };
+
+cvar_t doom_quakeweapons = CVARD("doom_quakeweapons", "0", "If enabled, use Quake 1 starting inventory and weapon slot mapping in Doom mode.");
 
 // Map a weapon's ammotype to the matching player ammo field (NULL = no ammo, e.g. fist/chainsaw).
 static float *Doom_AmmoField(edict_t *ent, int ammotype)
@@ -119,12 +123,24 @@ static void Doom_UpdateCurrentAmmo(edict_t *ent)
 // Give the Doom starting inventory: fist + pistol owned, 50 bullets, pistol equipped.
 static void Doom_SetupPlayer(edict_t *ent)
 {
-	ent->v->items = DWEP_FIST | DWEP_PISTOL;
-	ent->v->weapon = DW_PISTOL;
-	ent->v->ammo_shells = 0;
-	ent->v->ammo_nails = 50;
+	if (doom_quakeweapons.ival)
+	{	//Quake 1 style: Axe + Shotgun, 25 shells
+		ent->v->items = DWEP_FIST | DWEP_SHOTGUN;
+		ent->v->weapon = DW_SHOTGUN;
+		ent->v->ammo_shells = 25;
+		ent->v->ammo_nails = 0;
+	}
+	else
+	{	//Doom style: Fist + Pistol, 50 bullets
+		ent->v->items = DWEP_FIST | DWEP_PISTOL;
+		ent->v->weapon = DW_PISTOL;
+		ent->v->ammo_shells = 0;
+		ent->v->ammo_nails = 50;
+	}
 	ent->v->ammo_rockets = 0;
 	ent->v->ammo_cells = 0;
+	ent->v->armorvalue = 0;
+	ent->v->armortype = 0;	//no armour tier until one is picked up
 	Doom_UpdateCurrentAmmo(ent);
 }
 
@@ -153,7 +169,77 @@ void Doom_GiveAll(edict_t *ent)
 	Doom_GiveWeapons(ent);
 	Doom_GiveKeys(ent);
 	ent->v->armorvalue = 200;
+	ent->v->armortype  = 2;	//blue/mega tier (absorbs 1/2), matching the 200 points
 	if (ent->v->health < 100) ent->v->health = 100;
+}
+
+// Key bits in .items (above the 9 weapon bits) - KEEP IN SYNC with glmod_doom.c (DKEY_*).
+#define DKEY_BLUE   (512|4096)		//blue card + skull
+#define DKEY_YELLOW (1024|8192)		//yellow card + skull
+#define DKEY_RED    (2048|16384)	//red card + skull
+
+// Max-fill the four ammo pools (the per-type caps used by pickups in glmod_doom.c).
+static void Doom_FillAmmo(edict_t *ent)
+{
+	ent->v->ammo_nails  = 200;	//bullets
+	ent->v->ammo_shells = 50;
+	ent->v->ammo_rockets= 50;
+	ent->v->ammo_cells  = 300;
+}
+
+// Grant a single named item: `give shotgun|ssg|chaingun|rocket|plasma|bfg|chainsaw|pistol|fist`,
+// `give bullets|shells|rockets|cells|ammo|backpack`, `give bluekey|yellowkey|redkey`,
+// `give armor|health`. Returns true if 'what' was recognised (so the caller can fall through to the
+// Quake-style numeric give otherwise). Granting a weapon also tops up its ammo and equips it, so the
+// cheat is immediately usable - same spirit as picking the weapon up.
+qboolean Doom_GiveItem(edict_t *ent, const char *what)
+{
+	int wi = -1;	//DW_ index to grant+equip, if this names a weapon
+
+	if      (!Q_strcasecmp(what,"fist"))                                wi = DW_FIST;
+	else if (!Q_strcasecmp(what,"chainsaw"))                            wi = DW_CHAINSAW;
+	else if (!Q_strcasecmp(what,"pistol"))                              wi = DW_PISTOL;
+	else if (!Q_strcasecmp(what,"shotgun")    || !Q_strcasecmp(what,"sg"))  wi = DW_SHOTGUN;
+	else if (!Q_strcasecmp(what,"ssg")        || !Q_strcasecmp(what,"supershotgun")) wi = DW_SSG;
+	else if (!Q_strcasecmp(what,"chaingun")   || !Q_strcasecmp(what,"cg"))  wi = DW_CHAINGUN;
+	else if (!Q_strcasecmp(what,"rocket")     || !Q_strcasecmp(what,"rl") || !Q_strcasecmp(what,"rocketlauncher")) wi = DW_ROCKET;
+	else if (!Q_strcasecmp(what,"plasma")     || !Q_strcasecmp(what,"pg") || !Q_strcasecmp(what,"plasmagun")) wi = DW_PLASMA;
+	else if (!Q_strcasecmp(what,"bfg")        || !Q_strcasecmp(what,"bfg9000")) wi = DW_BFG;
+
+	if (wi >= 0)
+	{	//SSG only exists in Doom 2 (no SHT2 sprite in Doom 1) - don't grant an invisible weapon.
+		if (wi == DW_SSG && !COM_FCheckExists("sprites/SHT2A0"))
+			return true;	//recognised, but silently nothing to give
+		ent->v->items = (int)ent->v->items | doomweapons[wi].bit;
+		{	//top up the ammo this weapon eats so it's usable right away
+			float *a = Doom_AmmoField(ent, doomweapons[wi].ammotype);
+			if (a)
+			{
+				static const int cap[4] = {200,50,50,300};
+				*a = cap[doomweapons[wi].ammotype];
+			}
+		}
+		ent->v->weapon = wi;
+		Doom_UpdateCurrentAmmo(ent);
+		return true;
+	}
+
+	if (!Q_strcasecmp(what,"bullets")) { ent->v->ammo_nails  = 200; Doom_UpdateCurrentAmmo(ent); return true; }
+	if (!Q_strcasecmp(what,"shells"))  { ent->v->ammo_shells = 50;  Doom_UpdateCurrentAmmo(ent); return true; }
+	if (!Q_strcasecmp(what,"rockets")) { ent->v->ammo_rockets= 50;  Doom_UpdateCurrentAmmo(ent); return true; }
+	if (!Q_strcasecmp(what,"cells"))   { ent->v->ammo_cells  = 300; Doom_UpdateCurrentAmmo(ent); return true; }
+	if (!Q_strcasecmp(what,"ammo") || !Q_strcasecmp(what,"backpack"))
+		{ Doom_FillAmmo(ent); Doom_UpdateCurrentAmmo(ent); return true; }
+
+	if (!Q_strcasecmp(what,"bluekey")   || !Q_strcasecmp(what,"blue"))   { ent->v->items = (int)ent->v->items | DKEY_BLUE;   return true; }
+	if (!Q_strcasecmp(what,"yellowkey") || !Q_strcasecmp(what,"yellow")) { ent->v->items = (int)ent->v->items | DKEY_YELLOW; return true; }
+	if (!Q_strcasecmp(what,"redkey")    || !Q_strcasecmp(what,"red"))    { ent->v->items = (int)ent->v->items | DKEY_RED;    return true; }
+
+	if (!Q_strcasecmp(what,"armor") || !Q_strcasecmp(what,"armour")) { ent->v->armorvalue = 200; ent->v->armortype = 2; return true; }
+	if (!Q_strcasecmp(what,"greenarmor")) { ent->v->armorvalue = 100; ent->v->armortype = 1; return true; }
+	if (!Q_strcasecmp(what,"health"))                               { ent->v->health = 100;     return true; }
+
+	return false;	//not a Doom item name
 }
 
 // Doom weapon-slot selection from an impulse (1..7). Returns the DW_ index to switch to, or -1 if
@@ -162,6 +248,23 @@ static int Doom_SelectWeapon(edict_t *ent, int impulse)
 {
 	int owned = (int)ent->v->items;
 	int cur = (int)ent->v->weapon;
+
+	if (doom_quakeweapons.ival)
+	{	//Quake 1 mapping: 1:Axe 2:SG 3:SSG 4:CHG(NG) 5:PL(SNG) 6:GL 7:RL 8:BFG(LG)
+		switch (impulse)
+		{
+		case 1: return (owned&DWEP_FIST)?DW_FIST:-1;
+		case 2: return (owned&DWEP_SHOTGUN)?DW_SHOTGUN:-1;
+		case 3: return (owned&DWEP_SSG)?DW_SSG:-1;
+		case 4: return (owned&DWEP_CHAINGUN)?DW_CHAINGUN:-1;
+		case 5: return (owned&DWEP_PLASMA)?DW_PLASMA:-1;
+		case 6: return -1; //No GL equivalent
+		case 7: return (owned&DWEP_ROCKET)?DW_ROCKET:-1;
+		case 8: return (owned&DWEP_BFG)?DW_BFG:-1;
+		default: return -1;
+		}
+	}
+
 	switch (impulse)
 	{
 	case 1:
@@ -7842,13 +7945,22 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 		sv_player->v->impulse = ucmd->impulse;
 
 #ifdef MAP_DOOM
-	// On DOOM maps: when player presses USE (the +use button, NOT jump) scan
-	// forward for an activatable linedef and open it.
 	// +use maps to button bit 8 (NetQuake) or bit 4 (QuakeWorld); jump is bit 1
 	// (=button2), so we must read the raw usercmd bit here - button2 would make
 	// the jump key open doors (and there is no QC field for the use bit in Doom mode).
 	#define DOOM_USEBIT(b) ((b) & ((1u<<8)|(1u<<4)))
-	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
+	// End-of-level tally up: swallow all in-world Doom processing and let fire/use/jump dismiss it.
+	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom && Doom_IntermissionActive())
+	{
+		static qboolean wasdown = false;	//edge-detect so a held button doesn't skip instantly
+		qboolean down = (ucmd->buttons & (1u/*attack*/|2u/*jump*/)) || DOOM_USEBIT(ucmd->buttons);
+		if (down && !wasdown)
+			Doom_IntermissionButton();
+		wasdown = down;
+	}
+	// On DOOM maps: when player presses USE (the +use button, NOT jump) scan
+	// forward for an activatable linedef and open it.
+	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom && !Doom_IntermissionActive())
 	{
 		doommap_sv_t *dm = (doommap_sv_t*)sv.world.worldmodel->meshinfo;
 		vec3_t fwd, pos;
@@ -7934,7 +8046,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 	#undef DOOM_USEBIT
 
 	// DOOM walk-over triggers (W1 / WR specials): level exits, floor traps, teleporters, etc.
-	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom && sv_player->v->health > 0)
+	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom && sv_player->v->health > 0 && !Doom_IntermissionActive())
 	{
 		doommap_sv_t *dm = (doommap_sv_t*)sv.world.worldmodel->meshinfo;
 		float *cur = sv_player->v->origin;
@@ -8020,7 +8132,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 	// Doom player frame: item pickups, weapon switch, and weapon fire (auto-fire while button0 is
 	// held, gated by the equipped weapon's refire rate + ammo). When dead (no gamecode to respawn
 	// us) the fire button instead respawns at the start with a fresh inventory.
-	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom)
+	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom && !Doom_IntermissionActive())
 	{
 		{	//player pain / death sound (vanilla DSPLPAIN / DSPLDETH) on a health drop.
 			//Only fire while the player WAS alive (prevhealth>0): otherwise damage to the
@@ -8053,7 +8165,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 		{
 			//walk-over pickups into the full inventory (health/armour/ammo/owned weapons).
 			Doom_TryPickups(sv.world.worldmodel, sv_player->v->origin,
-				&sv_player->v->health, &sv_player->v->armorvalue,
+				&sv_player->v->health, &sv_player->v->armorvalue, &sv_player->v->armortype,
 				&sv_player->v->ammo_nails, &sv_player->v->ammo_shells,
 				&sv_player->v->ammo_rockets, &sv_player->v->ammo_cells,
 				&sv_player->v->items, &sv_player->v->weapon);
@@ -8079,9 +8191,34 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 				int wi = (int)sv_player->v->weapon;
 				const struct doomweapon_s *wp;
 				float *ammo;
+				int pellets, dmgbase;
+				float refire, range;
+				qboolean qmode = doom_quakeweapons.ival != 0;
+
 				if (wi < 0 || wi >= DW_COUNT)
 					wi = DW_PISTOL;
 				wp = &doomweapons[wi];
+
+				//Quake 1 weapon stats override
+				pellets = wp->pellets;
+				dmgbase = wp->dmgbase;
+				refire  = wp->refire;
+				range   = wp->range;
+				if (qmode)
+				{
+					switch(wi)
+					{
+					case DW_FIST:     dmgbase=20; refire=0.5f; break; //Axe
+					case DW_PISTOL:   pellets=6;  dmgbase=4;  refire=0.5f; break; //SG-light
+					case DW_SHOTGUN:  pellets=6;  dmgbase=4;  refire=0.5f; break; //SG
+					case DW_SSG:      pellets=14; dmgbase=4;  refire=0.7f; break; //SSG
+					case DW_CHAINGUN: pellets=1;  dmgbase=9;  refire=0.1f; break; //NG
+					case DW_PLASMA:   pellets=1;  dmgbase=18; refire=0.1f; break; //SNG
+					case DW_ROCKET:   dmgbase=120;refire=0.8f; break; //RL
+					case DW_BFG:      dmgbase=30; refire=0.1f; break; //LG (approx)
+					}
+				}
+
 				ammo = Doom_AmmoField(sv_player, wp->ammotype);
 				if (!ammo || *ammo >= wp->ammouse)
 				{	//spend ammo and fire
@@ -8098,14 +8235,14 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 					else
 					{
 						Doom_PlayerAttack(sv.world.worldmodel, sv_player->v->origin,
-							sv_player->v->angles[1], wp->pellets, wp->dmgbase, wp->range);
+							sv_player->v->angles[1], pellets, dmgbase, range);
 					}
 					{	//weapon fire sound (indexed by DW_*; missing lumps just stay silent)
 						static const char *wsnd[DW_COUNT]={"DSPUNCH","DSSAWFUL","DSPISTOL","DSSHOTGN",
 							"DSDSHTGN","DSPISTOL","DSRLAUNC","DSPLASMA","DSBFG"};
 						Doom_PlaySound(sv_player->v->origin, wsnd[wi]);
 					}
-					host_client->doom_refire = wp->refire;
+					host_client->doom_refire = refire;
 					host_client->doom_weapon_anim = 0; //start animation
 				}
 				else
@@ -8128,9 +8265,9 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 					{	//plasma: hold the fire frame (A) while firing; the "rest" frame (B) plays for a
 						//moment after you release, then back to idle (matches Doom's PLSG A fire / B refire).
 						if (sv_player->v->button0 && host_client->doom_refire > 0)
-							sv_player->v->weaponframe = 0;
+							sv_player->v->weaponframe = 1;	//'A' (fire)
 						else if (host_client->doom_weapon_anim < 0.45f)
-							sv_player->v->weaponframe = (len > 1) ? 1 : 0;
+							sv_player->v->weaponframe = (len > 1) ? 2 : 1;	//'B' (recoil/rest)
 						else
 							sv_player->v->weaponframe = 0;
 					}
@@ -8140,7 +8277,7 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 						float framedur = wp->refire / len;
 						int frame = (int)(host_client->doom_weapon_anim / framedur);
 						if (frame >= len) frame = len - 1;
-						sv_player->v->weaponframe = frame;
+						sv_player->v->weaponframe = frame + 1;
 					}
 					else
 						sv_player->v->weaponframe = 0; //idle
@@ -10121,6 +10258,7 @@ void SV_UserInit (void)
 	Cvar_Register (&sv_brokenmovetypes, "Backwards compatability");
 	Cvar_Register (&pext_ezquake_nochunks, cvargroup_servercontrol);
 	Cvar_Register (&pext_ezquake_verfortrans, cvargroup_servercontrol);
+	Cvar_Register (&doom_quakeweapons, "Doom");
 #endif
 }
 

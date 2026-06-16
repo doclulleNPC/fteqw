@@ -26,7 +26,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #ifdef MAP_DOOM
 void Doom_TickDoors(struct model_s *model, float frametime, const float *playerorg);
-void Doom_TickMonsters(struct model_s *model, float frametime, const float *playerorg, float *playerhealth, float *playerarmor, int godmode);
+void Doom_TickMonsters(struct model_s *model, float frametime, const float *playerorg, float *playerhealth, float *playerarmor, float *playerarmortype, int godmode);
 #endif
 
 /*
@@ -2594,7 +2594,7 @@ qboolean SV_Physics (void)
 			{
 				Doom_TickMonsters(sv.world.worldmodel, (float)trueframetime,
 					svs.clients[ci].edict->v->origin, &svs.clients[ci].edict->v->health,
-					&svs.clients[ci].edict->v->armorvalue,
+					&svs.clients[ci].edict->v->armorvalue, &svs.clients[ci].edict->v->armortype,
 					((int)svs.clients[ci].edict->v->flags & FL_GODMODE) ? 1 : 0);
 				break;
 			}

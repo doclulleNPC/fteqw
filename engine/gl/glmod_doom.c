@@ -24,6 +24,9 @@ static void Doom_EmitFX(doommap_t *dm);	//drain dm->fx -> particle effects (clie
 #define DMDL_GIB    4	//xdeath: parsed but not yet used by the renderer
 #define DMDL_NUMPH  5
 void Doom_PlaySound(const vec3_t org, const char *lump);
+struct doommap_s;
+qboolean Doom_IntermissionActive(void);				//is the end-of-level tally screen showing?
+static void Doom_StartIntermission(struct doommap_s *dm);	//exit reached -> snapshot stats, show tally
 
 //Thing render mode: ONE selector for how Doom's things (enemies, items, pickups, decorations, the
 //held weapon) are drawn. OG 2D sprites are always the baseline; a mode swaps in models or voxels
@@ -394,6 +397,13 @@ typedef struct doommap_s
 	} *monsters;
 	unsigned int nummonsters;
 
+	// Level tally stats (Doom intermission). Totals counted at spawn; counters bumped at kill/pickup/
+	// secret-cross. wi_leveltime accrues each tick (seconds). See Doom_StartIntermission.
+	int		wi_kills, wi_totalkills;
+	int		wi_items, wi_totalitems;
+	int		wi_secret, wi_totalsecret;
+	float	wi_leveltime;
+
 	// monster/player projectiles (imp/caco/baron balls, revenant homing tracer, rockets, ...)
 	struct doomproj_s {
 		vec3_t		origin, vel;	// position + velocity (units/sec)
@@ -749,23 +759,10 @@ static void Doom_ApplySpecialToSector(doommap_t *dm, int si, int special, int ta
 
 		// --- EXITS ---
 		case 11: case 51: case 52: case 124:
-		{	//advance to the next Doom map (plain `nextmap` has no target for a single +map load).
-			//ExMy -> ExM(y+1); mapNN -> map(NN+1). Secret exits (51/124) just go to the next map too.
-			char next[32]; const char *b = doom_mapbase;
-			if ((b[0]=='e'||b[0]=='E') && b[1]>='1'&&b[1]<='9' && (b[2]=='m'||b[2]=='M') && b[3]>='1'&&b[3]<='9')
-				Q_snprintfz(next, sizeof(next), "e%cm%d", b[1], atoi(b+3)+1);
-			else if (!Q_strncasecmp(b, "map", 3))
-				Q_snprintfz(next, sizeof(next), "map%02d", atoi(b+3)+1);
-			else
-				next[0] = 0;
-			//RESTRICT_LOCAL: `map`/`nextmap` are trusted server commands; at level 0 they are filtered
-			//out of the cbuf, which is why the exit reported "unknown command map".
-			if (next[0])
-				Cbuf_AddText(va("echo LEVEL COMPLETE; map %s\n", next), RESTRICT_LOCAL);
-			else
-				Cbuf_AddText("echo LEVEL COMPLETE; nextmap\n", RESTRICT_LOCAL);
+			//show the end-of-level tally screen; it loads the next map when the player dismisses it
+			//(or after the auto-advance timeout). Stats are snapshotted from dm here.
+			Doom_StartIntermission(dm);
 			break;
-		}
 	}
 }
 
@@ -2446,6 +2443,8 @@ static void Triangulate_Sectors(doommap_t *dm, dsector_t *sectorl, qboolean glbs
 		dm->sector[i].tag = sectorl[i].tag;
 		dm->sector[i].ceilingheight = sectorl[i].ceilingheight;
 		dm->sector[i].floorheight = sectorl[i].floorheight;
+		if (sectorl[i].specialtype == 9)
+			dm->wi_totalsecret++;	//tally denominator for "Secret %" (sector special 9 = secret)
 	}
 }
 
@@ -2554,6 +2553,7 @@ static void Doom_ExtractPName(unsigned int *out, doomimage_t *di, size_t imgsize
 	}
 }
 
+static qboolean Doom_UseHires(void);	//effective doom_hires state (defined with Doom_LoadShaders, below)
 static texid_t Doom_LoadPatchFromTexWad(char *name, void *texlump, unsigned short *width, unsigned short *height, qboolean *hasalpha)
 {
 	char patch[32] = "patches/";
@@ -2606,7 +2606,7 @@ static texid_t Doom_LoadPatchFromTexWad(char *name, void *texlump, unsigned shor
 			//namespace (FTextureManager::AddHiresTextures). The composited WAD pixels are the fallback,
 			//and the logical width/height stay the WAD's, so the UV math (s/tex->width) maps the sharper
 			//image across the SAME tiling - the gzdoom SetDisplaySize(origW,origH) trick, no distortion.
-			if (Cvar_Get("doom_hires","0",CVAR_ARCHIVE,"Doom")->value)
+			if (Doom_UseHires())
 			{
 				char lc[16]; size_t n=strnlen(name,8);
 				memcpy(lc,name,n); lc[n]=0; Q_strlwr(lc);
@@ -2825,6 +2825,29 @@ static qboolean Doom_IsPickup(unsigned short type)
 	}
 }
 
+//Things flagged MF_COUNTITEM in Doom (info.c) - the artifacts that count toward the level "Items %".
+//NOT weapons/ammo/keys/regular armour: only the bonus pickups and powerups. (Health/armour bonuses,
+//soulsphere, megasphere, invuln, berserk, invis, radsuit, computer map, light-amp visor.)
+static qboolean Doom_IsCountItem(unsigned short type)
+{
+	switch(type)
+	{
+	case 2014:	//health bonus (BON1)
+	case 2015:	//armor bonus (BON2)
+	case 2013:	//soulsphere
+	case 83:	//megasphere
+	case 2022:	//invulnerability
+	case 2023:	//berserk
+	case 2024:	//invisibility (blursphere)
+	case 2025:	//radiation suit
+	case 2026:	//computer area map
+	case 2045:	//light-amplification visor
+		return true;
+	default:
+		return false;
+	}
+}
+
 //hanging corpses (GOR*/HDB*) spawn from the ceiling, not the floor (Doom's SPAWNCEILING flag).
 //We anchor their billboard/model so the top touches the ceiling (origin = ceiling - height); the
 //upward-drawn billboard then spans [ceiling-h, ceiling], hanging correctly.
@@ -2881,6 +2904,8 @@ static void Doom_LoadThingSprites(doommap_t *dm)
 		out->w = sw; out->h = sh; out->xo = sxo; out->yo = syo;
 		out->pickup = Doom_IsPickup(dm->thing[i].type);
 		out->type = dm->thing[i].type;
+		if (Doom_IsCountItem(dm->thing[i].type))
+			dm->wi_totalitems++;	//tally denominator for the intermission "Items %"
 		Q_strncpyz(out->voxname, spr, sizeof(out->voxname));	//voxel name = sprite frame minus the rotation digit
 		{ int l=strlen(out->voxname); if(l>0) out->voxname[l-1]=0; }
 		dm->numsprites++;
@@ -3114,6 +3139,12 @@ void Doom_DrawHUD2D(void)
 
 	if (!cl.worldmodel || cl.worldmodel->loadstate!=MLS_LOADED || cl.worldmodel->fromgame!=fg_doom)
 		return;
+	if (Doom_IntermissionActive())
+	{	//level finished: the tally screen replaces the HUD (and covers the frozen world behind it)
+		void Doom_DrawIntermission(void);
+		Doom_DrawIntermission();
+		return;
+	}
 	pv = r_refdef.playerview ? r_refdef.playerview : cl.playerview;
 	st = pv->stats;
 	health=st[STAT_HEALTH]; armour=st[STAT_ARMOR]; ammo=st[STAT_AMMO]; items=st[STAT_ITEMS];
@@ -3239,6 +3270,230 @@ void Doom_DrawHUD2D(void)
 	R2D_ImageColours(1,1,1,1);
 }
 
+//=================================== end-of-level intermission =================================
+// Faithful Doom WI_stuff tally: level name + "Finished", Kills/Items/Secret % counting up with the
+// pistol tick sound, level Time vs Par, then "Entering <next>". Drawn in 320x200 screen space over a
+// black + WIMAP background. Driven entirely by realtime (the world is frozen via Doom_TickMonsters),
+// and it loads the next map when the count-up + hold finishes (or the player presses fire/use/jump).
+static struct doom_wi_s {
+	qboolean active;
+	int		episode;		// 1..4 (Doom 1), 0 = Doom 2 (mapNN)
+	int		thismap, nextmap;	// 1-based map numbers
+	char	nextcmd[24];		// "e1m2" / "map02" - the map to load when done
+	int		kills, totalkills, items, totalitems, secret, totalsecret;
+	int		time, partime;		// seconds
+	float	t0;			// realtime when the screen opened
+	float	lastsnd;		// realtime of the last count tick (throttle)
+	qboolean cocked;		// sgcock played at the stats->entering transition
+	qboolean advanced;		// map load already queued
+} doom_wi;
+
+qboolean Doom_IntermissionActive(void) { return doom_wi.active; }
+
+// Par times. Doom 1: pars[episode][map] (g_game.c; E4 from the Ultimate Doom release). Doom 2: cpars[].
+static const short doom1par[5][10] = {
+	{0},
+	{0,30,75,120,90,165,180,180,30,165},	//E1
+	{0,90,90,90,120,90,360,240,30,170},	//E2
+	{0,90,45,90,150,90,90,165,30,135},	//E3
+	{0,165,255,135,150,180,390,135,360,180},//E4 (Ultimate)
+};
+static const short doom2par[33] = {
+	0,
+	30,90,120,120,90,150,120,120,270,90,	//1-10
+	210,150,150,150,210,150,420,150,210,150,//11-20
+	240,150,180,150,150,300,330,420,300,180,//21-30
+	120,30					//31-32
+};
+
+static void Doom_StartIntermission(doommap_t *dm)
+{
+	const char *b = doom_mapbase;
+	memset(&doom_wi, 0, sizeof(doom_wi));
+	if ((b[0]=='e'||b[0]=='E') && b[1]>='1'&&b[1]<='9' && (b[2]=='m'||b[2]=='M'))
+	{
+		doom_wi.episode = b[1]-'0';
+		doom_wi.thismap = atoi(b+3);
+		doom_wi.nextmap = doom_wi.thismap+1;
+		Q_snprintfz(doom_wi.nextcmd, sizeof(doom_wi.nextcmd), "e%dm%d", doom_wi.episode, doom_wi.nextmap);
+		if (doom_wi.episode>=1 && doom_wi.episode<=4 && doom_wi.thismap>=1 && doom_wi.thismap<=9)
+			doom_wi.partime = doom1par[doom_wi.episode][doom_wi.thismap];
+	}
+	else if (!Q_strncasecmp(b, "map", 3))
+	{
+		doom_wi.episode = 0;
+		doom_wi.thismap = atoi(b+3);
+		doom_wi.nextmap = doom_wi.thismap+1;
+		Q_snprintfz(doom_wi.nextcmd, sizeof(doom_wi.nextcmd), "map%02d", doom_wi.nextmap);
+		if (doom_wi.thismap>=1 && doom_wi.thismap<=32)
+			doom_wi.partime = doom2par[doom_wi.thismap];
+	}
+	doom_wi.kills=dm->wi_kills;   doom_wi.totalkills=dm->wi_totalkills;
+	doom_wi.items=dm->wi_items;   doom_wi.totalitems=dm->wi_totalitems;
+	doom_wi.secret=dm->wi_secret; doom_wi.totalsecret=dm->wi_totalsecret;
+	doom_wi.time = (int)(dm->wi_leveltime + 0.5f);
+	doom_wi.t0 = realtime;
+	doom_wi.active = true;
+	S_LocalSound("wad/dssgcock");	//"screen up" cue
+}
+
+//pacing (seconds). Each percentage row counts up over WI_ROW; time/par appear after the three rows;
+//then a hold, then the "Entering" card, then the next map loads.
+#define WI_BEGIN 0.8f
+#define WI_ROW   1.1f
+#define WI_HOLD  2.2f
+#define WI_ENTER 2.6f
+
+static int Doom_WIPercent(int num, int den) { return den>0 ? (num*100)/den : 100; }
+
+//centre a patch horizontally on x=160 (Doom_HudDraw places its left edge at vx-xo, so add xo back)
+static void Doom_HudDrawC(const char *vfs, float y, float scale, float xoff)
+{
+	doomhudpic_t *p = Doom_HudPic(vfs);
+	if (!p || !p->sh) return;
+	Doom_HudDraw(vfs, 160.0f - p->w/2.0f + p->xo, y, scale, xoff);
+}
+//big yellow WINUM number + trailing % (WIPCNT), right-aligned with the % ending near xr
+static void Doom_WINumPct(int val, float xr, float y, qboolean pct, float scale, float xoff)
+{
+	float x = xr;
+	if (pct) { doomhudpic_t *p=Doom_HudPic("wad/wipcnt"); Doom_HudDraw("wad/wipcnt", x, y, scale, xoff); if(p&&p->sh) x -= p->w; }
+	Doom_HudNum(val, x, y, "wad/winum%d", 3, scale, xoff);	//right-aligned, ends at x
+}
+//M:SS clock from WINUM digits + WICOLON, right-aligned ending at xr
+static void Doom_WIClock(int secs, float xr, float y, float scale, float xoff)
+{
+	int mm=secs/60, ss=secs%60; char nm[28]; float x=xr;
+	doomhudpic_t *z=Doom_HudPic("wad/winum0"); int dw=z?z->w:11;
+	doomhudpic_t *c=Doom_HudPic("wad/wicolon"); int cw=(c&&c->sh)?c->w:6;
+	{ int s=ss, k; for(k=0;k<2;k++){ Q_snprintfz(nm,sizeof(nm),"wad/winum%d",s%10); s/=10; x-=dw; Doom_HudDraw(nm,x,y,scale,xoff); } }
+	x-=cw; if(c&&c->sh) Doom_HudDraw("wad/wicolon",x,y,scale,xoff);
+	{ int m=mm; do { Q_snprintfz(nm,sizeof(nm),"wad/winum%d",m%10); m/=10; x-=dw; Doom_HudDraw(nm,x,y,scale,xoff); } while(m); }
+}
+//the per-map level-name patch (Doom1 WILV<ep-1><map-1>, Doom2 CWILV<map-1>)
+static void Doom_WILevelName(char *out, size_t sz, int episode, int map)
+{
+	if (map < 1) map = 1;
+	if (episode>0) Q_snprintfz(out,sz,"wad/wilv%d%d", episode-1, map-1);
+	else           Q_snprintfz(out,sz,"wad/cwilv%02d", map-1);
+}
+
+void Doom_DrawIntermission(void)
+{
+	float scale = vid.height/200.0f;
+	float xoff  = (vid.width - 320.0f*scale)*0.5f;
+	float t = realtime - doom_wi.t0;
+	float statsend = WI_BEGIN + 3*WI_ROW;
+	qboolean entering = (t >= statsend + WI_HOLD);
+	char lump[28];
+
+	//black backdrop (covers the frozen 3D world, incl. the pillarbox at wide aspect) + WIMAP picture
+	R2D_ImageColours(0,0,0,1);
+	R2D_FillBlock(0, 0, vid.width, vid.height);
+	R2D_ImageColours(1,1,1,1);
+	if (doom_wi.episode>0)	//Doom 1 episode maps; Doom 2 has no WIMAP so it stays black
+	{
+		int wm = doom_wi.episode-1; if (wm<0) wm=0; if (wm>2) wm=2;	//only WIMAP0..2 exist
+		Q_snprintfz(lump,sizeof(lump),"wad/wimap%d",wm);
+		Doom_HudDraw(lump, 0, 0, scale, xoff);
+	}
+
+	if (entering)
+	{	//"Entering <next level>"
+		Doom_HudDrawC("wad/wienter", 10, scale, xoff);
+		Doom_WILevelName(lump, sizeof(lump), doom_wi.episode, doom_wi.nextmap);
+		Doom_HudDrawC(lump, 10+14, scale, xoff);
+		//play one cock as we flip to this card
+		if (!doom_wi.cocked) { doom_wi.cocked = true; S_LocalSound("wad/dssgcock"); }
+		//dismiss -> load the next map (after the enter card has been shown a moment, or auto-timeout)
+		if (!doom_wi.advanced && t >= statsend + WI_HOLD + WI_ENTER)
+		{
+			doom_wi.advanced = true;
+			doom_wi.active = false;
+			if (doom_wi.nextcmd[0])
+				Cbuf_AddText(va("echo LEVEL COMPLETE; map %s\n", doom_wi.nextcmd), RESTRICT_LOCAL);
+			else
+				Cbuf_AddText("echo LEVEL COMPLETE; nextmap\n", RESTRICT_LOCAL);
+		}
+		R2D_ImageColours(1,1,1,1);
+		return;
+	}
+
+	//---- "<this level> Finished" ----
+	Doom_WILevelName(lump, sizeof(lump), doom_wi.episode, doom_wi.thismap);
+	Doom_HudDrawC(lump, 2, scale, xoff);
+	Doom_HudDrawC("wad/wif", 2+14, scale, xoff);
+
+	//---- the three percentage rows, each counting up over its WI_ROW slice ----
+	{
+		const int SP_X=50, SP_Y=50, SP_DY=33, VAL_R=320-50;	//Doom SP_STATSX/Y/SPACINGY
+		struct { const char *lbl; int num, den; } row[3] = {
+			{"wad/wiostk", doom_wi.kills,  doom_wi.totalkills},
+			{"wad/wiosti", doom_wi.items,  doom_wi.totalitems},
+			{"wad/wiosts", doom_wi.secret, doom_wi.totalsecret},
+		};
+		int r; qboolean counting=false;
+		for (r=0; r<3; r++)
+		{
+			float rs = WI_BEGIN + r*WI_ROW;
+			float frac = (t-rs)/WI_ROW; if (frac<0) frac=0; if (frac>1) frac=1;
+			int target = Doom_WIPercent(row[r].num, row[r].den);
+			int shown = (int)(target*frac + 0.5f);
+			Doom_HudDraw(row[r].lbl, SP_X, SP_Y + r*SP_DY, scale, xoff);
+			if (t >= rs)	//row revealed
+				Doom_WINumPct(shown, VAL_R, SP_Y + r*SP_DY, true, scale, xoff);
+			if (t >= rs && frac < 1) counting=true;
+		}
+		if (counting && realtime - doom_wi.lastsnd > 0.065f)	//pistol tick while any row climbs
+			{ S_LocalSound("wad/dspistol"); doom_wi.lastsnd = realtime; }
+	}
+
+	//---- Time / Par (revealed once the rows are done) ----
+	if (t >= statsend - 0.001f)
+	{
+		Doom_HudDraw("wad/witime", 16, 200-32, scale, xoff);
+		Doom_WIClock(doom_wi.time, 16+58, 200-32, scale, xoff);
+		if (doom_wi.partime > 0)
+		{
+			Doom_HudDraw("wad/wipar", 160+48, 200-32, scale, xoff);
+			Doom_WIClock(doom_wi.partime, 320-16, 200-32, scale, xoff);
+		}
+	}
+	R2D_ImageColours(1,1,1,1);
+}
+
+//Skip/advance the tally with fire/use/jump, like Doom. Called from the Doom button paths in sv_user.c
+//(returns true if it consumed the press, so the button doesn't also act in-world). First press snaps
+//the count-up to done; second press (while "Entering") loads the next map immediately.
+qboolean Doom_IntermissionButton(void)
+{
+	if (!doom_wi.active)
+		return false;
+	{
+		float t = realtime - doom_wi.t0;
+		float statsend = WI_BEGIN + 3*WI_ROW;
+		if (t < statsend + WI_HOLD)
+			doom_wi.t0 = realtime - (statsend + WI_HOLD);	//snap to the "Entering" card
+		else if (!doom_wi.advanced)
+		{	//already entering: go now
+			doom_wi.advanced = true;
+			doom_wi.active = false;
+			if (doom_wi.nextcmd[0])
+				Cbuf_AddText(va("map %s\n", doom_wi.nextcmd), RESTRICT_LOCAL);
+			else
+				Cbuf_AddText("nextmap\n", RESTRICT_LOCAL);
+		}
+	}
+	return true;
+}
+
+//`doom_endlevel` console command: trigger the intermission for the current level (test/level-skip).
+static void Doom_EndLevel_f(void)
+{
+	if (cl.worldmodel && cl.worldmodel->fromgame==fg_doom && cl.worldmodel->meshinfo && !doom_wi.active)
+		Doom_StartIntermission((doommap_t*)cl.worldmodel->meshinfo);
+}
+
 //full death-animation frame sequence for each monster sprite, from gzdoom's zscript Death
 //states (multi-letter sub-frames expanded). Played over ~0.7s when killed; the LAST frame is
 //the resting corpse (held for -1 tics in Doom). NULL = no death frames (shouldn't happen).
@@ -3338,6 +3593,8 @@ static void Doom_LoadMonsters(doommap_t *dm)
 		m->yaw = dm->thing[i].angle;
 		m->health=mi.health; m->radius=(qbyte)mi.radius; m->speed=mi.speed; m->type=dm->thing[i].type; m->spr=mi.spr;
 		m->atk=mi.atk; m->meleedmg=mi.meleedmg; m->meleerand=mi.meleerand?mi.meleerand:8; m->misdmg=mi.misdmg; m->misspeed=mi.misspeed; m->bullets=mi.bullets; m->floating=mi.floating?1:0;
+		if (!(mi.atk & MATK_BARREL))
+			dm->wi_totalkills++;	//tally denominator for "Kills %" (barrels excluded, like Doom MF_COUNTKILL)
 		m->atkcool = 0.5f + (rand()&255)/128.0f;
 		m->deathtime = -1; m->paintime = -1; m->atktime = -1;
 		m->vilet = -1; m->risetime = -1;
@@ -3482,23 +3739,34 @@ void Doom_ResetMap(model_t *model)
 			dm->sector[d->sector_idx].ceilingheight = d->ceil_original;
 	}
 	dm->numactive_doors = 0;
+	//respawn replays the level fresh: zero the tally counters (monsters are alive again above, items
+	//are about to be rebuilt). wi_totalitems must be cleared too - Doom_LoadThingSprites recounts it.
+	dm->wi_kills = 0; dm->wi_items = 0; dm->wi_secret = 0; dm->wi_totalitems = 0; dm->wi_leveltime = 0;
 	Doom_LoadThingSprites(dm);	//rebuild the item/decoration billboards -> picked-up items return
 }
 
 //Doom damage rolls: base*random(1..8) (or *random(1..5) for bullets). A plain rand() is fine here.
 static int Doom_Rand(int lo, int hi) { return lo + (rand()%(hi-lo+1)); }
 
-//apply damage to the player, Doom-style: armour soaks a fraction (green 1/3), capped by how much
-//armour is left, and the rest comes off health. (P_DamageMobj in p_inter.c.)
+//apply damage to the player, Doom-style: armour soaks a fixed FRACTION of every hit - green (type 1)
+//absorbs 1/3, blue/mega (type 2) absorbs 1/2 - capped by how much armour is left, and the rest comes
+//off health. When the armour runs out the tier is forgotten, so the next hit is unprotected until you
+//pick up new armour. (P_DamageMobj in p_inter.c.)
 static int doom_playergod;	//set each tick from the player's FL_GODMODE; suppresses all player damage
+static float *doom_armortype;	//-> player's .armortype (1=green/33%, 2=blue/50%, 0=none); set per tick like doom_playergod
 static void Doom_HurtPlayer(float *health, float *armor, int dmg)
 {
 	if (dmg <= 0 || doom_playergod)
 		return;
 	if (armor && *armor > 0)
 	{
-		int saved = dmg/3;	//green armour absorbs 1/3 (blue 1/2; we don't track type yet)
-		if (saved > (int)*armor) saved = (int)*armor;
+		int type  = doom_armortype ? (int)*doom_armortype : 1;	//default green if the tier is unknown
+		int saved = (type >= 2) ? dmg/2 : dmg/3;				//blue absorbs 1/2, green 1/3
+		if ((int)*armor <= saved)
+		{	//armour used up this hit: take whatever is left and clear the tier
+			saved = (int)*armor;
+			if (doom_armortype) *doom_armortype = 0;
+		}
 		*armor -= saved;
 		dmg -= saved;
 	}
@@ -3717,6 +3985,7 @@ static void Doom_HurtMonster(doommap_t *dm, struct doommonster_s *m, int damage)
 		m->gibbed = (m->spawnhealth > 0 && m->health < -m->spawnhealth) ? 1 : 0;
 		if (!(m->atk & MATK_BARREL))	//barrels play DSBAREXP from Doom_BarrelExplode instead
 		{
+			dm->wi_kills++;	//tally numerator for "Kills %" (barrels aren't MF_COUNTKILL, so excluded)
 			Doom_PlaySound(m->origin, Doom_MonSound(m->spr,2));
 			Doom_AddFX(dm, hit, m->gibbed ? DFX_GIB : DFX_BLOOD);	//death spray (big if gibbed)
 		}
@@ -4086,12 +4355,13 @@ enum { DW_FIST, DW_CHAINSAW, DW_PISTOL, DW_SHOTGUN, DW_SSG, DW_CHAINGUN, DW_ROCK
 //summed) and apply it to the inventory. Called from sv_user.c each frame with the player's edict
 //fields. Ammo is capped at the Doom maxima; weapons grant ownership (a DWEP bit in *items) plus a
 //little ammo. Keys/powerups are collected but have no effect yet. Sprite removed by swap-with-last.
-void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, float *armor,
+void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, float *armor, float *armortype,
 	float *bullets, float *shells, float *rockets, float *cells, float *items, float *weapon)
 {
 	doommap_t *dm = model?model->meshinfo:NULL;
 	unsigned int s;
 	qboolean qmode = Cvar_Get("doom_quakeweapons", "0", 0, "Doom")->ival != 0;
+	doom_armortype = armortype;	//so the armour-pickup cases below can set the tier
 	if (!dm)
 		return;
 	for (s = 0; s < dm->numsprites; )
@@ -4109,11 +4379,11 @@ void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, floa
 			case 2011: if (health && *health < 100) *health = min(100,*health+10); break;	//stimpack
 			case 2012: if (health && *health < 100) *health = min(100,*health+25); break;	//medikit
 			case 2013: if (health && *health < 200) *health = min(200,*health+100); break;	//soulsphere
-			case 83:   if (health) *health=200; if (armor) *armor=200; break;	//megasphere
-			//armor
-			case 2015: if (armor && *armor < 200) *armor += 1; break;	//armor bonus
-			case 2018: if (armor && *armor < 100) *armor = (qmode?100:100); break;	//green armor (Quake: 100)
-			case 2019: if (armor) *armor = 200; break;	//blue armor (Quake: 200)
+			case 83:   if (health) *health=200; if (armor) *armor=200; if (doom_armortype) *doom_armortype=2; break;	//megasphere (blue-tier armour)
+			//armor (armortype: 1=green/33%, 2=blue/50%). P_GiveArmor caps the points at type*100.
+			case 2015: if (armor && *armor < 200) { *armor += 1; if (doom_armortype && *doom_armortype==0) *doom_armortype=1; } break;	//armor bonus (green tier if you had none)
+			case 2018: if (armor && *armor < 100) { *armor = 100; if (doom_armortype) *doom_armortype=1; } break;	//green armor
+			case 2019: if (armor && *armor < 200) { *armor = 200; if (doom_armortype) *doom_armortype=2; } break;	//blue armor
 			//ammo (caps: bullets 200, shells 50, rockets 50, cells 300)
 			case 2007: if (bullets) *bullets = min(200,*bullets+(qmode?25:10)); break;	//clip (Quake: 25 nails)
 			case 2048: if (bullets) *bullets = min(200,*bullets+50); break;	//box of bullets
@@ -4180,6 +4450,8 @@ void Doom_TryPickups(model_t *model, const vec3_t playerorg, float *health, floa
 				int isweap=(t==2001||t==82||t==2002||t==2005||t==2003||t==2004||t==2006);
 				Doom_PlaySound(playerorg, isweap?"DSWPNUP":"DSITEMUP");
 			}
+			if (Doom_IsCountItem(sp->type))
+				dm->wi_items++;	//tally numerator for the intermission "Items %"
 			dm->sprites[s] = dm->sprites[--dm->numsprites];
 			continue;
 		}
@@ -4246,13 +4518,30 @@ static void Doom_SpawnMonster(doommap_t *dm, unsigned short type, const vec3_t o
 //hitscan / launches a missile / does the archvile hellfire, else it walks closer. Movement is
 //gated on the destination sector being walkable (small step-up, enough headroom) and not blocked
 //by a wall; when the straight path is blocked it tries angled steps so it slides around obstacles.
-void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, float *playerhealth, float *playerarmor, int godmode)
+void Doom_TickMonsters(model_t *model, float frametime, const vec3_t playerorg, float *playerhealth, float *playerarmor, float *playerarmortype, int godmode)
 {
 	doommap_t *dm = model?model->meshinfo:NULL;
 	unsigned int i, old_nummonsters;
 	doom_playergod = godmode;	//honour the `god` console command in all player-damage paths
+	doom_armortype = playerarmortype;	//armour tier for the damage-split in Doom_HurtPlayer
 	if (!dm)
 		return;
+
+	if (Doom_IntermissionActive())
+		return;	//level finished: freeze the world (monsters/projectiles) while the tally screen shows
+
+	//level clock + secret-sector crossing (Doom P_PlayerInSpecialSector: special 9 = secret, found
+	//once when the player stands in it, then cleared). Drives the intermission Time/Secret stats.
+	dm->wi_leveltime += frametime;
+	{
+		msector_t *psec = Doom_SectorNearPoint(dm, playerorg);
+		if (psec && psec->specialtype == 9)
+		{
+			psec->specialtype = 0;	//count each secret once
+			dm->wi_secret++;
+			Doom_PlaySound(playerorg, "DSGETPOW");	//Doom plays no sound; a gentle cue that you found one
+		}
+	}
 
 	//(item pickups are handled in Doom_TryPickups, called from sv_user.c where the full player
 	//inventory - ammo and owned weapons, not just health/armour - is available.)
@@ -4564,6 +4853,8 @@ qboolean Doom_TeleportThing(model_t *model, int linedef_idx, vec3_t outorg, floa
 			{	//gibbed by the arrival
 				mo->mstate = 2;
 				mo->deathtime = 0;
+				if (!(mo->atk & MATK_BARREL))
+					dm->wi_kills++;	//telefragged monster still counts as a kill
 			}
 		}
 		outorg[0] = tp[0];
@@ -5304,7 +5595,7 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 	index_t idx[6] = {0,1,2, 0,2,3};
 
 	int sprrot, sprfreeze, usevox, usemod, usehd;
-	float voxscale, voxyaw, modscale, modyaw, modz;
+	float voxscale, voxyaw, modscale, modyaw, modz, spritez;
 	if (!dm->nummonsters && !dm->numprojectiles)
 		return;
 	sprrot = (int)Cvar_Get("doom_sprrot", "1", CVAR_ARCHIVE, "Doom Sprites")->value;	//1=8-way+mirror, 0=front only
@@ -5317,6 +5608,10 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 	modscale= Cvar_Get("doom_modscale", "1", CVAR_ARCHIVE, "Doom")->value;		//MD2 scale (Vavoom models are ~1:1 with map units)
 	modyaw  = Cvar_Get("doom_modyaw", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 facing offset (deg); 0 after the +90 voxel default was rotated 90 CW to match these models
 	modz    = Cvar_Get("doom_modz", "0", CVAR_ARCHIVE, "Doom")->value;		//MD2 vertical offset (deg) for tuning
+	//Sprite-mode vertical lift (map units). The Doom topoffset rests a billboard's bottom row on the
+	//floor, but the bottom pixels of a flat card read as "sunk" against the floor under a downward view
+	//(barrels, grounded monsters). A few units up keeps the feet visibly on top of the floor.
+	spritez = Cvar_Get("doom_spritez", "4", CVAR_ARCHIVE, "Doom Sprites")->value;
 	if (usevox) Doom_VoxShader();
 	viewang[0]=0; viewang[1]=r_refdef.viewangles[1]; viewang[2]=0;
 	AngleVectors(viewang, vpn, vright, vup);
@@ -5431,8 +5726,8 @@ static void R_DoomDrawMonsters(doommap_t *dm)
 				m->type, m->mstate, m->atktime, m->paintime, m->deathtime, m->risetime,
 				m->nwalk, m->natk, m->npain, m->ndeath, (void*)sh, (int)sw, (int)shh);
 		if (!sh) continue;
-		zb = m->origin[2] + syo - shh;
-		zt = m->origin[2] + syo;
+		zb = m->origin[2] + syo - shh + spritez;
+		zt = m->origin[2] + syo + spritez;
 		//mirrored rotations measure the hotspot from the opposite edge and draw the texture flipped
 		{ short xoe = mirror ? (short)(sw - sxo) : sxo;
 		  VectorMA(m->origin, -xoe,      vright, l);
@@ -5493,7 +5788,7 @@ static shader_t *Doom_BuildFlatShader(const char *lump)
 	Q_snprintfz(path, sizeof(path), "flats/%s.raw", lump);		//...but the raw 64x64 data is loaded from .raw
 	file = FS_LoadMallocFile(path, NULL);
 	if (!file) return NULL;
-	if (Cvar_Get("doom_hires","0",CVAR_ARCHIVE,"Doom")->value)
+	if (Doom_UseHires())
 	{	//hi-res anim frame too, so the whole liquid cycle stays sharp (not just the base frame)
 		char lc[16]; Q_strncpyz(lc, lump, sizeof(lc)); Q_strlwr(lc);
 		tn.base = Image_GetTexture(lc, "filter/doom/hires", 0, file, doompalette, 64, 64, TF_8PAL24);
@@ -5507,6 +5802,24 @@ static shader_t *Doom_BuildFlatShader(const char *lump)
 	return sh;
 }
 
+//Effective hi-res world-texture (DHTP) state. doom_hires is tri-state: -1 = AUTO (default; on iff a
+//DHTP-style pack is present, i.e. there are external images under filter/doom/hires/), 0 = force off,
+//>=1 = force on. AUTO means just dropping dhtp.pk3 into the doom gamedir enables the sharper PNG walls
+//and flats with no extra flags - while doom_hires 0 still lets you force the vanilla WAD look.
+static int QDECL Doom_HiresProbe_cb(const char *fname, qofs_t fsize, time_t mtime, void *parm, searchpathfuncs_t *spath)
+{	(void)fname;(void)fsize;(void)mtime;(void)spath; *(int*)parm = 1; return false; }	//one hit is enough
+static qboolean Doom_UseHires(void)
+{
+	int hr = (int)Cvar_Get("doom_hires", "-1", CVAR_ARCHIVE, "Doom")->value;
+	if (hr >= 0)
+		return hr != 0;				//explicit on/off wins
+	{	//auto: probe the DHTP namespace once (the listing lives in the mounted pk3's directory)
+		static int present = -1;
+		if (present < 0)
+		{	int found = 0; COM_EnumerateFiles("filter/doom/hires/*.png", Doom_HiresProbe_cb, &found); present = found; }
+		return present != 0;
+	}
+}
 static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 {
 	model_t *mod = ctx;
@@ -5528,7 +5841,7 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 	//hi-res textures: enabling doom_hires turns on FTE's external-texture replacement (gl_load24bit),
 	//so each wall/flat/sprite will use an external image named after it (e.g. flats/NUKAGE1.png,
 	//<wallname>.png, sprites/POSSA1.png) when one is present, falling back to the WAD art otherwise.
-	qboolean hires = (int)Cvar_Get("doom_hires", "0", CVAR_ARCHIVE, "Doom")->value;
+	qboolean hires = Doom_UseHires();
 	if (hires)
 	{
 		cvar_t *l24 = Cvar_FindVar("gl_load24bit");
@@ -6479,6 +6792,11 @@ qboolean QDECL Mod_LoadDoomLevel(model_t *mod, void *buffer, size_t fsize)
 		mod->hulls[h].available = false;
 
 	Doom_SetModelFunc(mod);
+
+	{	//register the level-skip / intermission-test command once
+		static qboolean cmdreg = false;
+		if (!cmdreg) { Cmd_AddCommand("doom_endlevel", Doom_EndLevel_f); cmdreg = true; }
+	}
 
 	mod->fromgame = fg_doom;
 	mod->type = mod_brush;

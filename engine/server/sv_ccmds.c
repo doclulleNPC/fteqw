@@ -359,9 +359,13 @@ static void SV_Give_f (void)
 	{
 		const char *what = Cmd_Argv(1);
 		extern void Doom_GiveAll(edict_t*); extern void Doom_GiveWeapons(edict_t*); extern void Doom_GiveKeys(edict_t*);
+		extern qboolean Doom_GiveItem(edict_t*, const char*);
 		if (!Q_strcasecmp(what,"all"))     { Doom_GiveAll(sv_player);     Con_Printf("Given everything.\n");  return; }
 		if (!Q_strcasecmp(what,"weapons")) { Doom_GiveWeapons(sv_player); Con_Printf("Given all weapons.\n"); return; }
 		if (!Q_strcasecmp(what,"keys"))    { Doom_GiveKeys(sv_player);    Con_Printf("Given all keys.\n");    return; }
+		//single items: give shotgun|ssg|chaingun|rocket|plasma|bfg|chainsaw|pistol|fist,
+		//bullets|shells|rockets|cells|ammo|backpack, bluekey|yellowkey|redkey, armor|health.
+		if (Doom_GiveItem(sv_player, what)) { Con_Printf("Given %s.\n", what); return; }
 	}
 #endif
 
