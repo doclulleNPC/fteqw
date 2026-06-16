@@ -3270,6 +3270,29 @@ void Doom_DrawHUD2D(void)
 	R2D_ImageColours(1,1,1,1);
 }
 
+//Title screen: draw the Doom TITLEPIC lump as the backdrop while disconnected (no level loaded), so
+//the FTE menu/console sit on top of it - the classic Doom title. Only fires in a Doom WAD context
+//(no TITLEPIC -> draws nothing), and never in-game. Called from SCR_DrawTwoDimensional before the menu.
+void Doom_DrawTitle(void)
+{
+	doomhudpic_t *p;
+	float scale, w, h, x;
+	if (cls.state != ca_disconnected)
+		return;	//connected / loading / in a level: the world + HUD own the screen
+	if (cl.worldmodel && cl.worldmodel->loadstate==MLS_LOADED && cl.worldmodel->fromgame==fg_doom)
+		return;	//a level is still resident (e.g. just disconnected): don't stomp it
+	Doom_LoadPalette();	//idempotent; TITLEPIC is palettised and the palette loads at FS init, not map load
+	p = Doom_HudPic("wad/titlepic");
+	if (!p || !p->sh)
+		return;	//not a Doom IWAD (no TITLEPIC) -> nothing to draw
+	R2D_ImageColours(0,0,0,1);
+	R2D_FillBlock(0,0,vid.width,vid.height);	//black pillarbox behind the 4:3 picture
+	R2D_ImageColours(1,1,1,1);
+	scale = vid.height/200.0f;			//TITLEPIC is 320x200; fill height, centre horizontally
+	w = 320*scale; h = 200*scale; x = (vid.width-w)*0.5f;
+	R2D_Image(x, 0, w, h, 0,0,1,1, p->sh);
+}
+
 //=================================== end-of-level intermission =================================
 // Faithful Doom WI_stuff tally: level name + "Finished", Kills/Items/Secret % counting up with the
 // pistol tick sound, level Time vs Par, then "Entering <next>". Drawn in 320x200 screen space over a

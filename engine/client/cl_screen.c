@@ -3629,6 +3629,10 @@ void SCR_DrawTwoDimensional(qboolean nohud)
 //		Editor_Draw();
 //#endif
 
+#ifdef MAP_DOOM
+	{ extern void Doom_DrawTitle(void); Doom_DrawTitle(); }	//Doom TITLEPIC backdrop when disconnected
+#endif
+
 	//if the console is not focused, show it scrolling back up behind the menu
 	if (!consolefocused)
 		SCR_DrawConsole (false);
