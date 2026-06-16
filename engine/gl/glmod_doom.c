@@ -5995,6 +5995,9 @@ static void Doom_Purge (struct model_s *mod)
 {
 	int texnum;
 	doommap_t *dm = mod->meshinfo;
+	if (!dm)
+		return;
+	//per-texture render meshes
 	for (texnum = 0; texnum < dm->numtextures; texnum++)
 	{
 		BZ_Free(dm->textures[texnum].mesh.colors4b_array);
@@ -6003,19 +6006,31 @@ static void Doom_Purge (struct model_s *mod)
 		BZ_Free(dm->textures[texnum].mesh.indexes);
 	}
 	BZ_Free(dm->textures);
-	dm->textures = NULL;
+	//gameplay arrays
 	BZ_Free(dm->sprites);
-	dm->sprites = NULL;
-	dm->numsprites = 0;
 	BZ_Free(dm->monsters);
-	dm->monsters = NULL;
-	dm->nummonsters = 0;
-	doomvoxshader = NULL;	//shader system is reset between maps; rebuilt lazily on next draw
-	doomhudpiccount = 0;	//HUD patch shaders are also reset between maps
-	BZ_Free(doommodels); doommodels=NULL; doommodelcount=0; doommodelsloaded=false;	//MD2 defs/skin shaders reload next map
 	BZ_Free(dm->projectiles);
-	dm->projectiles = NULL;
-	dm->numprojectiles = 0;
+	BZ_Free(dm->doorsectors);
+	//map geometry + raw lumps. All are independent mallocs (Z_Malloc / BZ_Malloc / FS_LoadMallocFile /
+	//handed-off GL-node builder buffers) - in this build Z_Free and BZ_Free are both plain free(), so the
+	//allocator pairing doesn't matter. blockmapofs aliases blockmap+1, so only blockmap is freed.
+	BZ_Free(dm->sector);
+	BZ_Free(dm->ssector);
+	BZ_Free(dm->seg);
+	BZ_Free(dm->vertexes);
+	BZ_Free(dm->sidedef);
+	BZ_Free(dm->node);
+	BZ_Free(dm->nodeplane);
+	BZ_Free(dm->lineplane);
+	BZ_Free(dm->thing);
+	BZ_Free(dm->linedef);
+	BZ_Free(dm->blockmap);
+	//global (non-per-map) render caches that must be rebuilt for the next map
+	doomvoxshader = NULL;	//shader system is reset between maps; rebuilt lazily on next draw
+	doomhudpiccount = 0;	//HUD + intermission patch shaders reload next map (stale shaders otherwise)
+	BZ_Free(doommodels); doommodels=NULL; doommodelcount=0; doommodelsloaded=false;	//MD2 defs/skin shaders reload next map
+	Z_Free(dm);		//the doommap_t itself (Z_Malloc'd in Mod_LoadDoomLevel)
+	mod->meshinfo = NULL;
 }
 #endif
 static void CleanWalls(doommap_t *dm, dsidedef_t *sidedefsl)

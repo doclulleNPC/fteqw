@@ -572,6 +572,14 @@ qboolean Mod_PurgeModel(model_t	*mod, enum mod_purge_e ptype)
 	PScript_ClearSurfaceParticles(mod);
 #endif
 
+#ifdef MAP_DOOM
+	//Doom maps keep their whole doommap_t graph in malloc'd memory (not mod->memgroup), so the
+	//generic brush purge below would just NULL meshinfo and leak it. Run the format's purge hook to
+	//free it - otherwise every visited map leaks a full map's geometry/textures (progressive slowdown).
+	if (mod->fromgame == fg_doom && mod->meshinfo && mod->funcs.PurgeModel)
+		mod->funcs.PurgeModel(mod);	//Doom_Purge: frees the doommap_t and sets meshinfo = NULL
+#endif
+
 	//and obliterate anything else remaining in memory.
 	mod->meshinfo = NULL;
 	if (mod->archive)

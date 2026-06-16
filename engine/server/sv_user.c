@@ -178,7 +178,8 @@ static void Doom_ApplyCarry(edict_t *ent)
 	ent->v->armortype    = doom_carry.armortype;
 	if (doom_carry.health > 0) ent->v->health = doom_carry.health;
 	Doom_UpdateCurrentAmmo(ent);
-	doom_carry.pending = false;
+	//NOTE: pending is NOT cleared here. Map spawn runs Doom_SetupPlayer twice (SV_SetUpClientEdict
+	//then SV_Begin_Core), each of which must re-apply the carry; the final stage clears pending.
 }
 
 //cheat/give helpers (used by `give all|weapons|keys` and IDKFA). The SSG is granted only when its
@@ -2801,6 +2802,13 @@ void SV_Begin_Core(client_t *split)
 								split->edict->v->view_ofs[2] = 17;	//DOOM eye height 41, minus the 24u the origin sits above the feet (mins.z=-24)
 								split->edict->v->health = 100;
 								Doom_SetupPlayer(split->edict);	//fist+pistol, 50 bullets
+								if (doom_carry.pending)
+								{	//arrived from a level exit: restore the carried inventory (this is the
+									//final spawn stage, so clear the carry now). Without this, this second
+									//Doom_SetupPlayer clobbered the carry that SV_SetUpClientEdict applied.
+									Doom_ApplyCarry(split->edict);
+									doom_carry.pending = false;
+								}
 								split->doom_refire = 0;
 								split->doom_autouse_ld = -1;	//no door auto-opened yet
 								if (doom_player1_start[0] || doom_player1_start[1] || doom_player1_start[2])
@@ -8045,7 +8053,14 @@ void SV_RunCmd (usercmd_t *ucmd, qboolean recurse)
 			int special = dm->linedef[best_ld].types;
 			int keymask = Doom_DoorKeyMask(special);
 			if (keymask && !((int)sv_player->v->items & keymask))
-				Doom_PlaySound(sv_player->v->origin, "DSNOWAY");	//locked: missing the key
+			{	//locked: tell the player which key they're missing (Doom PD_* messages) + DSNOWAY
+				const char *msg = "You need a key to open this door.";
+				if      (keymask & (512|4096))   msg = "You need a blue key to open this door.";
+				else if (keymask & (1024|8192))  msg = "You need a yellow key to open this door.";
+				else if (keymask & (2048|16384)) msg = "You need a red key to open this door.";
+				SV_ClientPrintf(host_client, PRINT_HIGH, "%s\n", msg);
+				Doom_PlaySound(sv_player->v->origin, "DSNOWAY");
+			}
 			else
 			{
 				Doom_ActivateLinedef(sv.world.worldmodel, best_ld);
