@@ -2212,8 +2212,11 @@ vk-profile:
 # classifier only (matches tools/zdbsp's own CMake on a 64-bit host). Only the
 # gl-tmp target links this and defines HAVE_DOOM_GLBSP (see just below).
 ZDBSP_DIR := $(BASE_DIR)/../../tools/zdbsp
-DOOMGLBSP_ODIR := $(RELEASE_DIR)/doomglbsp
-DOOMGLBSP_LIB := $(RELEASE_DIR)/libdoomglbsp.a
+# Per-ARCH paths so a Linux build and a cross build (e.g. FTE_TARGET=win64) don't clobber each
+# other's lib - the objects are compiled with $(CXX), so a shared path would leave stale objects
+# of the wrong arch and break the next link (undefined Doom_GLBSP_Build).
+DOOMGLBSP_ODIR := $(RELEASE_DIR)/doomglbsp-$(ARCH)
+DOOMGLBSP_LIB := $(RELEASE_DIR)/libdoomglbsp-$(ARCH).a
 DOOMGLBSP_CXXFLAGS := -O2 -ffast-math -fno-strict-aliasing -DDISABLE_SSE -DNO_MAP_VIEWER -I$(ZDBSP_DIR)
 DOOMGLBSP_OBJS := $(DOOMGLBSP_ODIR)/doom_glbsp.o \
 	$(DOOMGLBSP_ODIR)/nodebuild.o \
