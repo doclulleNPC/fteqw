@@ -3093,7 +3093,7 @@ int Doom_OneShotUse(int special)
 // from SCR_DrawTwoDimensional. Patches load from the WAD: standalone lumps are namespaced "wad/<lump>"
 // (fs_pak.c), sprites "sprites/<lump>". Layout coords are vanilla Doom (chocolate-doom st_stuff.c),
 // 320x200 virtual, scaled to the screen. Stats come from the player's STAT_* (health/armour/ammo/items).
-typedef struct { char key[28]; shader_t *sh; short w,h,xo,yo; } doomhudpic_t;
+typedef struct { char key[28]; shader_t *sh; shader_t *shadd; texid_t tex; short w,h,xo,yo; } doomhudpic_t;
 static doomhudpic_t doomhudpics[192]; static int doomhudpiccount;
 
 static doomhudpic_t *Doom_HudPic(const char *vfspath)
@@ -3110,10 +3110,25 @@ static doomhudpic_t *Doom_HudPic(const char *vfspath)
 	Q_snprintfz(sn,sizeof(sn),"doom_hud_%s",vfspath);
 	t=R_LoadTexture32(sn,img->width,img->height,tex,IF_NOMIPMAP|IF_CLAMP);
 	BZ_Free(tex); BZ_Free(img);
+	p->tex=t;
 	memset(&stn,0,sizeof(stn)); stn.base=t;
 	p->sh=R_RegisterShader(sn,SUF_NONE,"{\nnopicmip\n{\nmap $diffuse\nalphafunc ge128\nrgbgen vertex\nalphagen vertex\n}\n}\n");
 	R_BuildDefaultTexnums(&stn,p->sh,IF_NOMIPMAP);
 	return p;
+}
+//Draw a Doom patch ADDITIVELY (bright glow) - used for the weapon muzzle flash so it reads as a flash
+//rather than a flat overlay. Builds an additive shader bound to the same texture, cached per pic.
+static void Doom_HudDrawAdd(const char *vfspath, float vx, float vy, float scale, float xoff)
+{
+	doomhudpic_t *p=Doom_HudPic(vfspath);
+	if (!p || !p->sh || !TEXVALID(p->tex)) return;
+	if (!p->shadd)
+	{	char sn[48]; texnums_t stn; memset(&stn,0,sizeof(stn)); stn.base=p->tex;
+		Q_snprintfz(sn,sizeof(sn),"doom_flash_%s",vfspath);
+		p->shadd=R_RegisterShader(sn,SUF_NONE,"{\nnopicmip\n{\nmap $diffuse\nblendfunc gl_one gl_one\nrgbgen vertex\n}\n}\n");
+		R_BuildDefaultTexnums(&stn,p->shadd,IF_NOMIPMAP);
+	}
+	R2D_Image(xoff+(vx-p->xo)*scale, (vy-p->yo)*scale, p->w*scale, p->h*scale, 0,0,1,1, p->shadd);
 }
 static void Doom_HudDraw(const char *vfspath, float vx, float vy, float scale, float xoff)
 {	//draw a patch with its top-left at virtual (vx-xo, vy-yo), scaled, screen-x-offset by xoff
@@ -3210,12 +3225,13 @@ void Doom_DrawHUD2D(void)
 			wp=Doom_HudPic(lump);
 			if (wp && wp->sh)
 			{
-				//Draw muzzle flash on the first frame of firing
-				if (dwi==wi && dw_off<=0 && fi==1)
+				//Muzzle flash: drawn additively (bright glow) on the firing frame. SSG (SHT2) has no
+				//separate flash lump - its own fire frames include the flash - so it's skipped here.
+				if (dwi==wi && dw_off<=0 && fi==1 && dwi!=4)
 				{
 					char flump[24];
 					Q_snprintfz(flump,sizeof(flump),"sprites/%sFA0",wnames[dwi]);
-					Doom_HudDraw(flump, 160, 168, scale, xoff);
+					Doom_HudDrawAdd(flump, 160, 168, scale, xoff);
 				}
 
 				//Doom weapon sprites use psprite offsets authored so that V_DrawPatch at virtual (0,0)
@@ -5869,6 +5885,18 @@ static void Doom_LoadShaders(void *ctx, void *data, size_t a, size_t b)
 	{
 		cvar_t *l24 = Cvar_FindVar("gl_load24bit");
 		if (l24 && !l24->ival) Cvar_SetValue(l24, 1);	//external-image replacement must be on for the DHTP lookup
+
+		//Cap DHTP texture size. The pack ships 512-1024px PNGs per 64-128px Doom texture; uncapped they
+		//eat enormous VRAM (each map's textures persist in the image cache, so it piles up across maps ->
+		//progressive slowdown on low-VRAM GPUs). gl_max_size downscales at upload (GL_RoundDimensions);
+		//Doom's own WAD textures/sprites are tiny so only the hires PNGs are affected. doom_hires_maxsize
+		//= 0 leaves gl_max_size alone. Set persistently (uploads may be deferred past this call).
+		{
+			int cap = (int)Cvar_Get("doom_hires_maxsize", "512", CVAR_ARCHIVE, "Doom")->value;
+			cvar_t *ms = Cvar_FindVar("gl_max_size");
+			if (cap > 0 && ms && (ms->value <= 0 || ms->value > cap))
+				Cvar_SetValue(ms, cap);
+		}
 	}
 
 	if (dm->skytex >= 0)
