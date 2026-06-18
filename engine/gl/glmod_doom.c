@@ -3116,19 +3116,20 @@ static doomhudpic_t *Doom_HudPic(const char *vfspath)
 	R_BuildDefaultTexnums(&stn,p->sh,IF_NOMIPMAP);
 	return p;
 }
-//Draw a Doom patch ADDITIVELY (bright glow) - used for the weapon muzzle flash so it reads as a flash
-//rather than a flat overlay. Builds an additive shader bound to the same texture, cached per pic.
-static void Doom_HudDrawAdd(const char *vfspath, float vx, float vy, float scale, float xoff)
+//Return a Doom patch with an ADDITIVE (bright glow) shader built+cached, for the weapon muzzle flash
+//so it reads as a flash rather than a flat overlay. NULL if the lump is missing. The caller draws it
+//(R2D_Image with p->shadd) so it can align/scale the flash to the on-screen weapon.
+static doomhudpic_t *Doom_FlashPic(const char *vfspath)
 {
 	doomhudpic_t *p=Doom_HudPic(vfspath);
-	if (!p || !p->sh || !TEXVALID(p->tex)) return;
+	if (!p || !p->sh || !TEXVALID(p->tex)) return NULL;
 	if (!p->shadd)
 	{	char sn[48]; texnums_t stn; memset(&stn,0,sizeof(stn)); stn.base=p->tex;
 		Q_snprintfz(sn,sizeof(sn),"doom_flash_%s",vfspath);
 		p->shadd=R_RegisterShader(sn,SUF_NONE,"{\nnopicmip\n{\nmap $diffuse\nblendfunc gl_one gl_one\nrgbgen vertex\n}\n}\n");
 		R_BuildDefaultTexnums(&stn,p->shadd,IF_NOMIPMAP);
 	}
-	R2D_Image(xoff+(vx-p->xo)*scale, (vy-p->yo)*scale, p->w*scale, p->h*scale, 0,0,1,1, p->shadd);
+	return p;
 }
 static void Doom_HudDraw(const char *vfspath, float vx, float vy, float scale, float xoff)
 {	//draw a patch with its top-left at virtual (vx-xo, vy-yo), scaled, screen-x-offset by xoff
@@ -3225,21 +3226,30 @@ void Doom_DrawHUD2D(void)
 			wp=Doom_HudPic(lump);
 			if (wp && wp->sh)
 			{
-				//Muzzle flash: drawn additively (bright glow) on the firing frame. SSG (SHT2) has no
-				//separate flash lump - its own fire frames include the flash - so it's skipped here.
-				if (dwi==wi && dw_off<=0 && fi==1 && dwi!=4)
-				{
-					char flump[24];
-					Q_snprintfz(flump,sizeof(flump),"sprites/%sFA0",wnames[dwi]);
-					Doom_HudDrawAdd(flump, 160, 168, scale, xoff);
-				}
-
 				//Doom weapon sprites use psprite offsets authored so that V_DrawPatch at virtual (0,0)
 				//centres them and rests the bottom on the 168-line (status-bar top). doom_weaponscale
 				//shrinks the weapon about that bottom-centre anchor (160,168) so it isn't oversized.
 				//dw_off slides it down for the raise/lower switch animation.
-				R2D_Image(xoff + (160 + (-wp->xo-160)*f)*scale, (168 - wp->h*f + dw_off)*scale,
-				          wp->w*f*scale, wp->h*f*scale, 0,0,1,1, wp->sh);
+				float wx = xoff + (160 + (-wp->xo-160)*f)*scale;
+				float wy = (168 - wp->h*f + dw_off)*scale;
+				R2D_Image(wx, wy, wp->w*f*scale, wp->h*f*scale, 0,0,1,1, wp->sh);
+
+				//Muzzle flash on the firing frame, drawn ADDITIVELY over the weapon. It must use the same
+				//weaponscale (f) as the weapon and align to it via the Doom psprite offset difference
+				//(flash_TL - weapon_TL = wp.offset - flash.offset) - otherwise it lands full-size off the
+				//muzzle and looks absent. SSG (SHT2) has no separate flash lump (its fire frames include it).
+				if (dwi==wi && dw_off<=0 && fi==1 && dwi!=4)
+				{
+					char flump[24]; doomhudpic_t *fp;
+					Q_snprintfz(flump,sizeof(flump),"sprites/%sFA0",wnames[dwi]);
+					fp = Doom_FlashPic(flump);
+					if (fp)
+					{
+						R2D_ImageColours(1,1,1,1);
+						R2D_Image(wx + (wp->xo - fp->xo)*f*scale, wy + (wp->yo - fp->yo)*f*scale,
+						          fp->w*f*scale, fp->h*f*scale, 0,0,1,1, fp->shadd);
+					}
+				}
 			}
 		}
 		#undef DW_DOWN
