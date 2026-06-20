@@ -2454,6 +2454,41 @@ void MC_Main_Predraw(emenu_t *menu)
 #endif
 }
 
+#ifdef MAP_DOOM
+//Doom "New Game" -> skill (difficulty) select. Sets the `skill` cvar (read at map load by the Doom
+//thing spawner) then starts the first level. Stacks over the main menu; ESC returns to it.
+void M_Menu_DoomSkill_f (void)
+{
+	static const char *names[5] = {
+		"I'm too young to die",
+		"Hey, not too rough",
+		"Hurt me plenty",
+		"Ultra-Violence",
+		"Nightmare!",
+	};
+	const char *firstmap = COM_FCheckExists("wad/cwilv00") ? "map01" : "e1m1";	//Doom 2 vs Doom 1
+	static menuresel_t resel;
+	emenu_t *m;
+	int i, y = 60;
+
+	if (!FS_GameIsInitialised() || !Renderer_Started())
+		return;
+	S_LocalSound ("misc/menu2.wav");
+	m = M_CreateMenu(0);
+	for (i = 0; i < 5; i++)
+	{
+		menubutton_t *b = MC_AddConsoleCommandQBigFont(m, 56, y, names[i],
+			va("skill %d; wait; map %s\n", i, firstmap));
+		if (i == 2)	//default cursor on "Hurt me plenty", like Doom
+			m->selecteditem = (menuoption_t *)b;
+		y += 18;
+	}
+	if (!m->selecteditem)
+		m->selecteditem = m->options;
+	m->cursoritem = (menuoption_t *)MC_AddCursor(m, &resel, 40, m->selecteditem->common.posy);
+}
+#endif
+
 void M_Menu_Main_f (void)
 {
 	extern cvar_t m_helpismedia;
@@ -2526,7 +2561,7 @@ void M_Menu_Main_f (void)
 		mainm->key = MC_Main_Key;
 		y = 84;
 		mainm->selecteditem = (menuoption_t *)
-		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("New Game      "),	"map e1m1\n");		y += 20;
+		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("New Game      "),	"menu_doomskill\n");	y += 20;
 		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("Multiplayer   "),	"menu_multi\n");	y += 20;
 		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("^bOptions       "),	"menu_options\n");	y += 20;
 		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("Quit          "),	"menu_quit\n");		y += 20;

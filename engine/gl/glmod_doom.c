@@ -2865,9 +2865,21 @@ static qboolean Doom_ThingHangs(unsigned short type)
 
 //resolve every item/decoration thing to a billboard (sprite shader + floor position),
 //ready for R_DoomDrawSprites. Runs on the main thread (textures) once geometry is loaded.
+//Which thing-flag bit a thing must carry to spawn at the current `skill` (Doom P_SpawnMapThing):
+//skill 0-1 (ITYTD/HNTR) -> EASY, 2 (HMP) -> MEDIUM, 3-4 (UV/NM) -> HARD. The Doom skill-select menu
+//sets `skill` before `map`. Without filtering, every skill-tagged thing spawned (too many monsters).
+static int Doom_SkillBit(void)
+{
+	int s = (int)Cvar_Get("skill","2",CVAR_ARCHIVE,"Doom")->value;
+	if (s <= 1) return THING_EASY;
+	if (s == 2) return THING_MEDIUM;
+	return THING_HARD;
+}
+
 static void Doom_LoadThingSprites(doommap_t *dm)
 {
 	unsigned int i;
+	int skillbit = Doom_SkillBit();
 	dm->numsprites = 0;
 	for (i = 0; i < dm->numthings; i++)
 	{
@@ -2882,6 +2894,8 @@ static void Doom_LoadThingSprites(doommap_t *dm)
 			continue;
 		if (dm->thing[i].flags & THING_DEATHMATCH)
 			continue;	//multiplayer-only thing (MTF_NOTSINGLE): not present in single player
+		if (Doom_IsPickup(dm->thing[i].type) && !(dm->thing[i].flags & skillbit))
+			continue;	//skill-filter pickups (Doom P_SpawnMapThing); decorations stay regardless
 		tex = Doom_LoadSprite(spr, &sw, &sh, &sxo, &syo);
 		if (!TEXVALID(tex))
 			continue;
@@ -3623,6 +3637,7 @@ static char Doom_PainFrame(const char *spr)
 static void Doom_LoadMonsters(doommap_t *dm)
 {
 	unsigned int i;
+	int skillbit = Doom_SkillBit();
 	dm->nummonsters = 0;
 	for (i = 0; i < dm->numthings; i++)
 	{
@@ -3633,6 +3648,8 @@ static void Doom_LoadMonsters(doommap_t *dm)
 			continue;
 		if (dm->thing[i].flags & THING_DEATHMATCH)
 			continue;
+		if (!(dm->thing[i].flags & skillbit))
+			continue;	//not present at this skill (Doom P_SpawnMapThing)
 		dm->monsters = BZ_Realloc(dm->monsters, sizeof(*dm->monsters)*(dm->nummonsters+1));
 		m = &dm->monsters[dm->nummonsters++];
 		memset(m, 0, sizeof(*m));
