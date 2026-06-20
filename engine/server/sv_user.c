@@ -5972,12 +5972,11 @@ void SV_SetUpClientEdict (client_t *cl, edict_t *ent)
 	if (sv.world.worldmodel && sv.world.worldmodel->fromgame == fg_doom &&
 		(doom_player1_start[0] || doom_player1_start[1] || doom_player1_start[2]))
 	{
-		//Disable the engine pmove step-up: the Doom move path is the sole authority for stepping
-		//(Doom_Trace lets the player walk onto floors <=24.1 higher + Doom_PlayerFloorSnap lifts them).
-		//With pm_stepheight non-zero the engine ALSO stepped up 24.1 when blocked, then Doom_Trace allowed
-		//another 24.1 onto the new floor - compounding to ~48u climbs ("step height too high"). 0 caps the
-		//step at Doom's 24, and descending falls via gravity, matching vanilla (Doom has no downstep glue).
-		Cbuf_AddText("sv_stepheight 0\n", RESTRICT_LOCAL);	//level 0 -> "no privileges for pm_stepheight"
+		//NOTE: pm_stepheight 0 was tried to fix "step too high" but it broke gravity (jumps left the
+		//player floating - the engine's ground/downstep handling that the floor-snap relies on was gone).
+		//Reverted to 24.1. The step-too-high (pmove step + Doom_Trace allowance + snap compounding to ~48u)
+		//needs a different fix that keeps the engine pmove handling gravity.
+		Cbuf_AddText("sv_stepheight 24.1\n", RESTRICT_LOCAL);	//level 0 -> "no privileges for pm_stepheight"
 		// VectorCopy(doom_player1_start, ent->v->origin);
 		VectorCopy(doom_player1_start, ent->v->origin);
 		ent->v->angles[1]  = doom_player1_yaw;	//set the view yaw too (see PutClientInServer) so the facing applies

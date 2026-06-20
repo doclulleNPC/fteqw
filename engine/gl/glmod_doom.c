@@ -3260,7 +3260,7 @@ void Doom_DrawHUD2D(void)
 					if (fp)
 					{
 						R2D_ImageColours(1,1,1,1);
-						R2D_Image(wx + (wp->xo - fp->xo)*f*scale, wy + (wp->yo - fp->yo)*f*scale,
+						R2D_Image(wx + (wp->xo - fp->xo)*f*scale, wy + (wp->yo - fp->yo + fp->h*0.5f)*f*scale,
 						          fp->w*f*scale, fp->h*f*scale, 0,0,1,1, fp->shadd);
 					}
 				}
