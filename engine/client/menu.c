@@ -1385,7 +1385,8 @@ void M_Init_Internal (void)
 
 	Cmd_AddCommand ("menu_main", M_Menu_Main_f);	//I've moved main to last because that way tab give us main and not quit.
 #ifdef MAP_DOOM
-	Cmd_AddCommand ("menu_doomskill", M_Menu_DoomSkill_f);	//Doom New Game -> skill select
+	Cmd_AddCommand ("menu_doomepisode", M_Menu_DoomEpisode_f);	//Doom 1 New Game -> episode select
+	Cmd_AddCommand ("menu_doomskill", M_Menu_DoomSkill_f);		//-> skill select
 #endif
 
 	Cmd_AddCommand ("menu_options", M_Menu_Options_f);

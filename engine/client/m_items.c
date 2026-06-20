@@ -2455,6 +2455,48 @@ void MC_Main_Predraw(emenu_t *menu)
 }
 
 #ifdef MAP_DOOM
+//Doom 1 "New Game" -> episode select. Lists only the episodes whose first map is present (shareware
+//has E1 only; registered E1-E3; Ultimate E1-E4). Each entry opens the skill menu for that episode's
+//first map. Doom 2 skips this (no episodes) and goes straight to the skill menu (map01).
+void M_Menu_DoomEpisode_f (void)
+{
+	static const char *epnames[4] = {
+		"Knee-Deep in the Dead",
+		"The Shores of Hell",
+		"Inferno",
+		"Thy Flesh Consumed",
+	};
+	static menuresel_t resel;
+	emenu_t *m;
+	int e, y = 48, count = 0;
+
+	if (!FS_GameIsInitialised() || !Renderer_Started())
+		return;
+	S_LocalSound ("misc/menu2.wav");
+	m = M_CreateMenu(0);
+	for (e = 1; e <= 4; e++)
+	{
+		char mapname[8], lump[16];
+		menubutton_t *b;
+		Q_snprintfz(mapname, sizeof(mapname), "e%dm1", e);
+		//detect via the episode's ExM1 level-name graphic (WILV<ep-1>0) - a "wad/" lump that's
+		//reliably in the VFS at menu time, unlike the raw map lumps.
+		Q_snprintfz(lump, sizeof(lump), "wad/wilv%d0", e-1);
+		if (!COM_FCheckExists(lump))
+			continue;	//this episode isn't in the IWAD (shareware has E1 only)
+		b = MC_AddConsoleCommandQBigFont(m, 48, y, epnames[e-1], va("menu_doomskill %s\n", mapname));
+		if (!m->selecteditem)
+			m->selecteditem = (menuoption_t *)b;
+		y += 18; count++;
+	}
+	if (!count)	//no episodes found (shouldn't happen) - fall back straight to the skill menu
+	{
+		M_RemoveMenu(m);
+		Cbuf_AddText("menu_doomskill\n", RESTRICT_LOCAL);
+		return;
+	}
+	m->cursoritem = (menuoption_t *)MC_AddCursor(m, &resel, 32, m->selecteditem->common.posy);
+}
 //Doom "New Game" -> skill (difficulty) select. Sets the `skill` cvar (read at map load by the Doom
 //thing spawner) then starts the first level. Stacks over the main menu; ESC returns to it.
 void M_Menu_DoomSkill_f (void)
@@ -2466,7 +2508,8 @@ void M_Menu_DoomSkill_f (void)
 		"Ultra-Violence",
 		"Nightmare!",
 	};
-	const char *firstmap = COM_FCheckExists("wad/cwilv00") ? "map01" : "e1m1";	//Doom 2 vs Doom 1
+	//map to start: the episode's first map if passed ("menu_doomskill e2m1"), else default (Doom2 map01 / Doom1 e1m1)
+	const char *firstmap = (Cmd_Argc() > 1) ? Cmd_Argv(1) : (COM_FCheckExists("wad/cwilv00") ? "map01" : "e1m1");
 	static menuresel_t resel;
 	emenu_t *m;
 	int i, y = 60;
@@ -2557,11 +2600,13 @@ void M_Menu_Main_f (void)
 	if (COM_FCheckExists("wad/titlepic"))	//Doom IWAD mounted -> a Doom-flavoured main menu over the
 	{					//TITLEPIC backdrop (drawn by Doom_DrawTitle), instead of the bare
 						//"Join server" fallback (Doom has no gfx/ttl_main.lmp etc.).
+		//Doom 1 has episodes -> New Game goes to episode select first; Doom 2 (cwilv00) goes straight to skill.
+		const char *newgame = COM_FCheckExists("wad/cwilv00") ? "menu_doomskill\n" : "menu_doomepisode\n";
 		mainm = M_CreateMenu(0);
 		mainm->key = MC_Main_Key;
 		y = 84;
 		mainm->selecteditem = (menuoption_t *)
-		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("New Game      "),	"menu_doomskill\n");	y += 20;
+		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("New Game      "),	newgame);		y += 20;
 		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("Multiplayer   "),	"menu_multi\n");	y += 20;
 		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("^bOptions       "),	"menu_options\n");	y += 20;
 		MC_AddConsoleCommandQBigFont	(mainm, 72, y,	localtext("Quit          "),	"menu_quit\n");		y += 20;

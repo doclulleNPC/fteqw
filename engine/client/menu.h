@@ -438,6 +438,7 @@ void M_Menu_BasedirPrompt(ftemanifest_t *man);
 const char *M_ChooseAutoSave(void);
 void M_Menu_Main_f (void);
 #ifdef MAP_DOOM
+void M_Menu_DoomEpisode_f (void);	//Doom 1 New Game -> episode select
 void M_Menu_DoomSkill_f (void);	//Doom New Game -> skill (difficulty) select
 #endif
 	void M_Menu_SinglePlayer_f (void);
